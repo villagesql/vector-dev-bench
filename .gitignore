@@ -1,0 +1,14 @@
+# Scratch server datadirs / sockets / logs (created by start_*.sh)
+.run/
+.run-maria/
+.run-pg/
+
+# Python env
+.venv/
+__pycache__/
+*.pyc
+
+# Probe / stats logs the harness or instrumentation write to /tmp are not here,
+# but any local stat dumps land here:
+*_stats.log
+.datasets/
