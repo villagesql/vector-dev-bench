@@ -251,6 +251,64 @@ def _mysql_conn(socket):
     return conn
 
 
+def _new_mysql_conn(socket):
+    """Open a FRESH, independent PyMySQL connection (not the cached global one).
+    Used by the concurrent-reader worker processes (--readers N): each worker is
+    its own OS process (multiprocessing -- no GIL) and owns one connection."""
+    import pymysql
+    from pymysql.constants import CLIENT as PYMYSQL_CLIENT
+
+    kind, host, port = _parse_conn(socket)
+    max_packet = 1 << 30
+    if kind == "tcp":
+        conn = pymysql.connect(host=host, port=port, user="bench",
+                               password="bench",
+                               client_flag=PYMYSQL_CLIENT.MULTI_STATEMENTS,
+                               max_allowed_packet=max_packet)
+    else:
+        conn = pymysql.connect(unix_socket=host, user="root",
+                               client_flag=PYMYSQL_CLIENT.MULTI_STATEMENTS,
+                               max_allowed_packet=max_packet)
+    conn.autocommit(True)
+    return conn
+
+
+# Per-worker-process persistent connection, opened once in the pool initializer
+# so connection setup stays OUT of the timed query region.
+_WORKER_CONN = None
+
+
+def _reader_init(socket):
+    """multiprocessing.Pool initializer: each worker process opens ONE connection
+    up front (before any timed work), stored per-process."""
+    global _WORKER_CONN
+    _WORKER_CONN = _new_mysql_conn(socket)
+
+
+def _reader_warmup(_i):
+    """Untimed pool task: touch the per-process connection so it is fully open
+    (initializer already opened it) before the timed query region starts."""
+    _WORKER_CONN.ping(reconnect=True)
+    return True
+
+
+def _reader_run(sql_text):
+    """One concurrent reader task (runs in a separate OS process -- no GIL). Runs
+    its shard of `;`-batched query SQL on the process's pre-opened connection and
+    returns the RAW result lines (tab-joined, @@Q-delimited). Does NO parsing or
+    recall -- the parent scores the merged lines AFTER the timed region ends, so
+    the measured wall-clock is server query execution only, not client-side CPU."""
+    cur = _WORKER_CONN.cursor()
+    lines = []
+    cur.execute(sql_text)
+    while True:
+        for row in cur.fetchall():
+            lines.append("\t".join("" if v is None else str(v) for v in row))
+        if not cur.nextset():
+            break
+    return lines
+
+
 def run_sql(client_bin, socket, sql, want_rows=False):
     """Run SQL via the active client. `client_bin` is used only for the psql
     path; the MySQL path uses a persistent PyMySQL connection. `socket` is a
@@ -441,6 +499,15 @@ def main():
                          "rebuild needed). Overrides --ef-search.")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--readers", type=int, default=1,
+                    help="number of concurrent reader threads for the query "
+                         "phase (default 1 = the original serial path). N>1 "
+                         "shards the queries across N threads, each on its own "
+                         "connection, and reports AGGREGATE QPS (total queries / "
+                         "wall-clock) -- use to measure read scaling / the "
+                         "decoded-vector cache's concurrency behaviour. Recall is "
+                         "unchanged (per-query correctness is thread-independent). "
+                         "mysql only; ignored for psql.")
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--mysql", default=DEFAULT_MYSQL)
     # TCP alternative to --socket, for a server in a container with its port
@@ -669,28 +736,97 @@ CREATE DATABASE recall_bench; USE recall_bench;
                    for qi in range(args.queries))
         return hits / (args.queries * args.k), args.queries / qsec if qsec > 0 else float("inf")
 
+    def _build_query_sql(qids):
+        # Build one `;`-batched statement string for the given query indices.
+        # Each query is preceded by a '@@Q<i>' sentinel SELECT so the raw output
+        # can be split back into per-query id lists during scoring. Mirrors
+        # run_queries()'s statement shape exactly (so recall is identical).
+        parts = [use_prefix]
+        order = metric.get("order", "")
+        for qi in qids:
+            dist = metric["dist_fn"].format(qlit=lit(queries[qi]))
+            parts.append(f"SELECT '@@Q{qi}' AS m;")
+            parts.append(f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};")
+        return "\n".join(parts)
+
+    def run_queries_parallel(ef, nreaders):
+        # Concurrent-reader QPS: shard the queries across `nreaders` OS processes
+        # (multiprocessing -> real parallelism, no GIL), each on its own
+        # connection. Only the parallel query execution is timed; connection
+        # setup happens in the pool initializer (warm-up) and ALL parsing/recall
+        # scoring happens here in the parent AFTER the clock stops. Aggregate QPS
+        # = total_queries / wall_clock, the number that reveals read scaling.
+        import multiprocessing as mp
+
+        qids = list(range(args.queries))
+        # Contiguous shards keep each worker's batch a similar size.
+        shards = [qids[i::nreaders] for i in range(nreaders)]
+        shards = [s for s in shards if s]           # drop empties if readers>queries
+        sql_batches = [_build_query_sql(s) for s in shards]
+
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(processes=len(sql_batches),
+                        initializer=_reader_init, initargs=(args.socket,))
+        try:
+            # Warm up: force each worker to open its connection before timing.
+            pool.map(_reader_warmup, range(len(sql_batches)))
+            t = time.time()
+            results = pool.map(_reader_run, sql_batches)   # <-- timed region only
+            qsec = time.time() - t
+        finally:
+            pool.close()
+            pool.join()
+
+        # Post-processing (untimed): merge raw lines, parse @@Q -> per-query ids.
+        per = {}
+        for lines in results:
+            cur = None
+            for line in lines:
+                s = line.strip()
+                if s.startswith("@@Q"):
+                    cur = int(s[3:]); per[cur] = []
+                elif cur is not None and s.isdigit():
+                    per[cur].append(int(s))
+        hits = sum(len(set(per.get(qi, [])[:args.k]) & truth[qi])
+                   for qi in range(args.queries))
+        qps = args.queries / qsec if qsec > 0 else float("inf")
+        return hits / (args.queries * args.k), qps
+
     if args.queries == 0:
         # Build-only probe (e.g. a build without the optimizer, so KNN SELECT
         # won't route). Report build time; no queries, no recall.
         print(f"build_time_s={build_s:.2f}{split}  (build-only; queries skipped)")
         return 0
 
+    # --readers N (>1) fans queries out across N OS processes for AGGREGATE QPS
+    # (read-scaling / cache-concurrency). mysql only -- psql keeps the serial
+    # path (its ef_search GUC is session-scoped and rides inside the batch).
+    parallel_readers = args.readers if (args.readers > 1 and CLIENT != "psql") else 1
+    if args.readers > 1 and CLIENT == "psql":
+        print("NOTE: --readers is mysql-only; using serial path for psql.")
+
+    def query_at(ef):
+        return (run_queries_parallel(ef, parallel_readers)
+                if parallel_readers > 1 else run_queries(ef))
+
     if sweep:
         # Build once, re-query at each ef_search value.
-        print(f"build_time_s={build_s:.2f}{split}  (index built once; sweeping ef_search)")
+        rtag = f"  readers={parallel_readers} (aggregate qps)" if parallel_readers > 1 else ""
+        print(f"build_time_s={build_s:.2f}{split}  (index built once; sweeping ef_search){rtag}")
         print(f"{'ef_search':<10} {'recall@'+str(args.k):<12} {'qps':<8}")
         worst = 1.0
         for ef in sweep:
             set_ef(ef)                 # mysql: GLOBAL; psql: no-op (folded below)
-            rec, qps = run_queries(ef)  # psql: SET rides inside the query batch
+            rec, qps = query_at(ef)     # psql: SET rides inside the query batch
             worst = min(worst, rec)
             print(f"{ef:<10} {rec:<12.4f} {qps:<8.1f}")
         return 0 if worst >= args.threshold else 1
 
     # single run
     set_ef(args.ef_search)
-    recall, qps = run_queries(args.ef_search)
-    print(f"build_time_s={build_s:.2f}{split}  qps={qps:.1f}  recall@{args.k}={recall:.4f}  "
+    recall, qps = query_at(args.ef_search)
+    rtag = f"  readers={parallel_readers}" if parallel_readers > 1 else ""
+    print(f"build_time_s={build_s:.2f}{split}  qps={qps:.1f}{rtag}  recall@{args.k}={recall:.4f}  "
           f"threshold={args.threshold}")
     if recall >= args.threshold:
         print("PASS"); return 0
