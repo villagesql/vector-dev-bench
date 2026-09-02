@@ -270,10 +270,12 @@ def _mysql_conn(socket):
     return conn
 
 
-def _new_mysql_conn(socket):
+def _new_mysql_conn(socket, database=None):
     """Open a FRESH, independent PyMySQL connection (not the cached global one).
-    Used by the concurrent-reader worker processes (--readers N): each worker is
-    its own OS process (multiprocessing -- no GIL) and owns one connection."""
+    Used by the concurrent worker processes (--readers / --build-threads): each
+    worker is its own OS process (multiprocessing -- no GIL) and owns one
+    connection. `database` selects the schema AT CONNECT (so statements need no
+    `USE ...;` prefix and can use unqualified table names)."""
     import pymysql
     from pymysql.constants import CLIENT as PYMYSQL_CLIENT
 
@@ -281,11 +283,11 @@ def _new_mysql_conn(socket):
     max_packet = 1 << 30
     if kind == "tcp":
         conn = pymysql.connect(host=host, port=port, user="bench",
-                               password="bench",
+                               password="bench", database=database,
                                client_flag=PYMYSQL_CLIENT.MULTI_STATEMENTS,
                                max_allowed_packet=max_packet)
     else:
-        conn = pymysql.connect(unix_socket=host, user="root",
+        conn = pymysql.connect(unix_socket=host, user="root", database=database,
                                client_flag=PYMYSQL_CLIENT.MULTI_STATEMENTS,
                                max_allowed_packet=max_packet)
     conn.autocommit(True)
@@ -340,10 +342,10 @@ def _insert_run(args):
     Drives PARALLEL INDEX BUILD from the client side (N connections inserting into
     the same table+index concurrently) to test whether the graph absorbs
     concurrent inserts, isolating it from the server's internal parallel-DDL.
-    `args` = (socket, stmts). Returns (rows_executed, error): error is None on
-    success, else the exception string of the FIRST failing batch."""
-    socket, stmts = args
-    conn = _new_mysql_conn(socket)  # autocommit(True) inside
+    `args` = (socket, database, stmts). Returns (rows_executed, error): error is
+    None on success, else the exception string of the FIRST failing batch."""
+    socket, database, stmts = args
+    conn = _new_mysql_conn(socket, database=database)  # schema selected at connect
     n = 0
     try:
         cur = conn.cursor()
@@ -725,20 +727,26 @@ def main():
         # incremental: index in setup; post/no-index: table only, index later/never
         ddl_line = "" if (args.no_index or post_index) else index_ddl + ";"
         schema = f"CREATE TABLE t (id INT PRIMARY KEY, v {coltype} NOT NULL);\n{ddl_line}"
-    # Per-client "use the working schema" prefix. MySQL/MariaDB use a dedicated
-    # `recall_bench` database; Postgres just uses the pre-created `bench` db (the
-    # psql client already connects to it), so there DROP/CREATE the table only.
+    # MySQL/MariaDB use a dedicated `recall_bench` database; Postgres uses the
+    # pre-created `bench` db (psql already connects to it). No per-statement
+    # `USE ...;` prefix -- the connection selects the schema once (below), so
+    # every statement runs in-context with unqualified table names.
+    use_prefix = ""
     if CLIENT == "psql":
-        use_prefix = ""
         setup = f"DROP TABLE IF EXISTS t;\n{schema}"
     else:
-        use_prefix = "USE recall_bench;"
         setup = f"""
 DROP DATABASE IF EXISTS recall_bench;
 CREATE DATABASE recall_bench; USE recall_bench;
 {schema}
 """
     run_sql(args.mysql, args.socket, setup)
+    # Select the working schema on the persistent connection so all later
+    # run_sql() statements run in-context (no USE prefix). The setup's own
+    # trailing `USE recall_bench` set it for the setup batch, but be explicit so
+    # it survives even if run_sql reconnects.
+    if CLIENT != "psql":
+        _mysql_conn(args.socket).select_db("recall_bench")
 
     def lit(v): return prof["vec_literal"].format(lit=vec_lit(v), dim=args.dim)
 
@@ -761,7 +769,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
         for start in range(lo, hi, bs):
             rows = ",\n".join(f"({i}, {lit(data[i])})"
                               for i in range(start, min(start + bs, hi)))
-            stmts.append(f"{use_prefix} INSERT INTO t VALUES\n{rows}")
+            stmts.append(f"INSERT INTO t VALUES\n{rows}")
         return stmts
 
     build_threads = (args.build_threads
@@ -782,9 +790,11 @@ CREATE DATABASE recall_bench; USE recall_bench;
         edges = [round(k * args.n / build_threads) for k in range(build_threads + 1)]
         shards = [(edges[k], edges[k + 1]) for k in range(build_threads)]
         shards = [s for s in shards if s[1] > s[0]]
-        # Each task = (socket, list-of-per-batch-INSERT-statements). The worker
-        # opens its own connection from the socket (no shared pool connection).
-        tasks = [(args.socket, _insert_batch_stmts(s)) for s in shards]
+        # Each task = (socket, database, per-batch-INSERT-statements). The worker
+        # opens its own connection with the schema selected (no USE prefix, no
+        # shared pool connection).
+        _db = None if CLIENT == "psql" else "recall_bench"
+        tasks = [(args.socket, _db, _insert_batch_stmts(s)) for s in shards]
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=len(tasks))
         try:
@@ -801,17 +811,21 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # worker connections are closed (pool.map returned), so every insert is
         # durable -- a single fresh read is exact, no poll/settle needed.
         cnt = run_sql(args.mysql, args.socket,
-                      f"{use_prefix} SELECT COUNT(*) FROM t;", want_rows=True)
+                      "SELECT COUNT(*) FROM t;", want_rows=True)
         got = int(cnt[0]) if cnt else -1
         status = "OK" if got == args.n and not errs else "MISMATCH!"
         print(f"  build-threads={build_threads}: {got}/{args.n} rows committed "
               f"{status}{' (worker errors above)' if errs else ''}")
     else:
+        # Build ALL the INSERT SQL strings BEFORE timing -- the vector->text
+        # formatting (lit()) is expensive Python work and must NOT be inside the
+        # timed region, or the serial baseline is charged for string-building that
+        # the parallel path (which pre-builds its statements) excludes. Timing
+        # only the server round-trips keeps serial vs --build-threads comparable.
+        serial_stmts = _insert_batch_stmts((0, args.n))
         t0 = time.time()
-        for start in range(0, args.n, bs):
-            rows = ",\n".join(f"({i}, {lit(data[i])})"
-                              for i in range(start, min(start + bs, args.n)))
-            run_sql(args.mysql, args.socket, f"{use_prefix} INSERT INTO t VALUES\n{rows};")
+        for stmt in serial_stmts:
+            run_sql(args.mysql, args.socket, f"{stmt};")
         insert_s = time.time() - t0
 
     # 'post' mode: the index does NOT exist yet — build it now (bulk), timed
@@ -819,7 +833,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
     index_s = 0.0
     if post_index:
         ti = time.time()
-        run_sql(args.mysql, args.socket, f"{use_prefix} {post_index};")
+        run_sql(args.mysql, args.socket, f"{post_index};")
         index_s = time.time() - ti
 
     build_s = insert_s + index_s
@@ -832,12 +846,8 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # query phase, no ground truth. (Unlike --queries 0, which the --dataset
         # path rewrites to 'all queries', this genuinely runs zero queries, so it
         # isolates the concurrent insert.) A short concurrent build = lost rows.
-        if CLIENT == "psql":
-            cnt = run_sql(args.mysql, args.socket, "SELECT COUNT(*) FROM t;",
-                          want_rows=True)
-        else:
-            cnt = run_sql(args.mysql, args.socket,
-                          f"{use_prefix} SELECT COUNT(*) FROM t;", want_rows=True)
+        cnt = run_sql(args.mysql, args.socket, "SELECT COUNT(*) FROM t;",
+                      want_rows=True)
         got = int(cnt[0]) if cnt else -1
         ok = "OK" if got == args.n else f"MISMATCH (expected {args.n})"
         print(f"build_time_s={build_s:.2f}{split}  rows={got}/{args.n} {ok}  "
@@ -903,7 +913,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
         if CLIENT == "psql":
             parts = [f"SET {prof['ef_search_var']} = {ef};"] if ef is not None else []
         else:
-            parts = [use_prefix]
+            parts = []
         for qi in range(args.queries):
             parts.append(f"SELECT '@@Q{qi}' AS m;")
             parts.append(_one_query_stmt(qi))
@@ -926,7 +936,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # Each query is preceded by a '@@Q<i>' sentinel SELECT so the raw output
         # can be split back into per-query id lists during scoring. Mirrors
         # run_queries()'s statement shape exactly (so recall is identical).
-        parts = [use_prefix]
+        parts = []
         for qi in qids:
             parts.append(f"SELECT '@@Q{qi}' AS m;")
             parts.append(_one_query_stmt(qi))
