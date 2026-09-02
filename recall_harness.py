@@ -330,6 +330,98 @@ def _reader_run(sql_text):
     return lines
 
 
+def _rw_read_worker(arg):
+    """READ-under-write load: one reader process runs KNN queries in a tight loop
+    for `duration` wall-seconds, cycling through a fixed pool of pre-built query
+    SQL strings, and stamps (cumulative_count, wall_ts) every `sample_every`
+    queries. Owns its own connection. Returns the list of samples; the parent
+    merges all readers' samples into a per-second QPS time series.
+    All workers share an absolute WALL-CLOCK start (t_start, from the parent's
+    time.time()) so read and write timelines align across processes; samples are
+    stamped as (count, ts - t_start) = seconds-since-start.
+    arg = (socket, database, query_sqls, t_start, duration_s, sample_every, k,
+           read_uncommitted)."""
+    import time as _t
+    (socket, database, query_sqls, t_start, duration_s, sample_every, k,
+     read_uncommitted) = arg
+    conn = _new_mysql_conn(socket, database=database)
+    samples = []  # (cumulative_count, seconds_since_start)
+    n = 0
+    m = len(query_sqls)
+    try:
+        cur = conn.cursor()
+        if read_uncommitted:
+            # DIAGNOSTIC/workaround for the err-1500 read-under-write bug: at
+            # READ UNCOMMITTED the reader has no consistent snapshot, so a KNN
+            # hit pointing at a concurrently-inserted (otherwise-invisible) row
+            # is now visible -> the clustered lookup finds it -> no
+            # DB_RECORD_NOT_FOUND. Proves the failure is MVCC visibility; NOT a
+            # correctness fix (dirty reads).
+            cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        while _t.time() < t_start:      # align to shared start
+            _t.sleep(0.002)
+        deadline = t_start + duration_s
+        while True:
+            cur.execute(query_sqls[n % m])
+            cur.fetchall()
+            n += 1
+            if n % sample_every == 0:
+                now = _t.time()
+                samples.append((n, now - t_start))
+                if now >= deadline:
+                    break
+            elif (n & 63) == 0 and _t.time() >= deadline:
+                samples.append((n, _t.time() - t_start))
+                break
+        return samples
+    finally:
+        conn.close()
+
+
+def _rw_write_worker(arg):
+    """WRITE load (the perturbation): one writer process, after `start_offset`
+    wall-seconds, runs batched INSERTs of RANDOM vectors into the same table for
+    `write_duration` seconds, sleeping `delay` seconds between insert statements
+    (dials write pressure). ids start at id_base+shard_offset and never collide
+    with the initial load or other writers. Owns its own connection. Returns
+    (rows_inserted, error_or_None).
+    Uses the same shared WALL-CLOCK start t_start as the readers, so writes begin
+    at t_start + start_offset and the read-QPS graph aligns.
+    arg = (socket, database, dim, batch, delay, t_start, start_offset,
+           write_duration, id_base, seed)."""
+    import time as _t
+    import numpy as _np
+    (socket, database, dim, batch, delay, t_start, start_offset, write_duration,
+     id_base, seed) = arg
+    conn = _new_mysql_conn(socket, database=database)
+    rng = _np.random.default_rng(seed)
+    nid = id_base
+    n = 0
+    try:
+        cur = conn.cursor()
+        # Align to the shared clock: wait until t_start + start_offset.
+        while _t.time() < t_start + start_offset:
+            _t.sleep(0.01)
+        deadline = t_start + start_offset + write_duration
+        while _t.time() < deadline:
+            vecs = rng.standard_normal((batch, dim)).astype(_np.float32)
+            rows = ",\n".join(
+                "({}, '[{}]')".format(nid + j,
+                                      ",".join(str(int(x)) for x in vecs[j]))
+                for j in range(batch))
+            try:
+                cur.execute(f"INSERT INTO t VALUES\n{rows}")
+            except Exception as e:  # noqa: BLE001
+                return (n, str(e))
+            nid += batch
+            n += batch
+            if delay > 0:
+                _t.sleep(delay)
+        return (n, None)
+    finally:
+        conn.close()
+
+
 def _insert_run(args):
     """One concurrent INSERTER task (separate OS process). Owns its connection's
     FULL lifecycle: open -> insert its shard (independent per-batch INSERTs, not
@@ -612,6 +704,51 @@ def main():
                          "(e.g. 127.0.0.1 for a container with -p PORT:3306)")
     ap.add_argument("--port", type=int, default=3306,
                     help="TCP port when --host is set (default 3306)")
+    # --- read-under-write benchmark (--rw-bench) ---
+    ap.add_argument("--rw-bench", action="store_true",
+                    help="READ-UNDER-WRITE benchmark: build the index, then run a "
+                         "timed KNN read load (--readers threads, --rw-duration "
+                         "sec) while a concurrent INSERT load of RANDOM vectors "
+                         "runs in the middle (--rw-write-threads, starting at "
+                         "--rw-write-start for --rw-write-duration, --rw-write-"
+                         "delay between statements). Emits per-second read QPS "
+                         "(read-alone -> read+write -> recover) as a table, an "
+                         "ASCII sparkline, and a CSV (--rw-csv). mysql only.")
+    ap.add_argument("--rw-duration", type=float, default=30.0,
+                    help="rw-bench: total read-load seconds (default 30)")
+    ap.add_argument("--rw-sample-every", type=int, default=50,
+                    help="rw-bench: each reader stamps (count, ts) every N "
+                         "queries (default 50)")
+    ap.add_argument("--rw-write-threads", type=int, default=2,
+                    help="rw-bench: concurrent INSERT writer processes (default 2)")
+    ap.add_argument("--rw-write-start", type=float, default=10.0,
+                    help="rw-bench: seconds into the read load before writes "
+                         "start (default 10)")
+    ap.add_argument("--rw-write-duration", type=float, default=10.0,
+                    help="rw-bench: how long the write load runs (default 10)")
+    ap.add_argument("--rw-write-delay", type=float, default=0.0,
+                    help="rw-bench: seconds to sleep between INSERT statements "
+                         "per writer -- dials write pressure (0 = as fast as "
+                         "possible; default 0)")
+    ap.add_argument("--rw-write-batch", type=int, default=100,
+                    help="rw-bench: rows per writer INSERT statement (default 100)")
+    ap.add_argument("--rw-csv", default=None,
+                    help="rw-bench: write the per-second QPS series to this CSV")
+    ap.add_argument("--rw-read-sql", default=None,
+                    help="rw-bench: override the reader's query with this exact "
+                         "SQL (e.g. 'SELECT MAX(id) FROM t'). CONTROL for the "
+                         "read-under-write failure: a plain non-index read that "
+                         "ALSO fails => generic/harness; only the KNN read "
+                         "failing => the custom-index fetch path.")
+    ap.add_argument("--rw-read-uncommitted", action="store_true",
+                    help="rw-bench: set each reader session to READ UNCOMMITTED. "
+                         "Diagnostic/workaround for the err-1500 read-under-write "
+                         "bug (a KNN hit on a concurrently-inserted, MVCC-"
+                         "invisible row -> DB_RECORD_NOT_FOUND -> error 122). At "
+                         "READ UNCOMMITTED the row is visible so the fetch "
+                         "succeeds. If this makes the failure vanish, the cause "
+                         "is confirmed MVCC visibility. NOT a correctness fix "
+                         "(dirty reads).")
     args = ap.parse_args()
 
     # --host switches to TCP: fold host/port into the socket spec so every
@@ -853,6 +990,108 @@ CREATE DATABASE recall_bench; USE recall_bench;
         print(f"build_time_s={build_s:.2f}{split}  rows={got}/{args.n} {ok}  "
               f"(build-only; no queries)")
         return 0 if got == args.n else 1
+
+    if args.rw_bench:
+        # READ-under-WRITE load benchmark. NO ground truth / recall -- pure load.
+        # (Placed before the ground-truth block so it's skipped entirely.)
+        import math
+        import multiprocessing as mp
+        if CLIENT == "psql":
+            print("ERROR: --rw-bench is mysql-only.", file=sys.stderr)
+            return 2
+        # ef_search once, server-side GLOBAL (readers inherit it).
+        ef = args.ef_search if args.ef_search is not None else 100
+        run_sql(args.mysql, args.socket,
+                f"SET GLOBAL {prof['ef_search_var']} = {ef};")
+        _db = "recall_bench"
+        # Pre-build the read SQL pool; readers cycle through it. Built ONCE here,
+        # outside the timed loop. --rw-read-sql overrides the KNN query with an
+        # arbitrary read (e.g. "SELECT MAX(id) FROM t") -- a CONTROL: if a plain
+        # non-index read ALSO fails under concurrent writes, the read-under-write
+        # failure is generic (or a harness issue), not the ANN/custom-index fetch
+        # path; if only the KNN read fails, it's the custom-index path.
+        if args.rw_read_sql:
+            query_sqls = [args.rw_read_sql]
+        else:
+            order = metric.get("order", "")
+            query_sqls = [
+                f"SELECT id FROM t ORDER BY "
+                f"{metric['dist_fn'].format(qlit=lit(queries[qi]))} {order} "
+                f"LIMIT {args.k}"
+                for qi in range(args.queries)]
+
+        nR = args.readers
+        nW = args.rw_write_threads
+        t_start = time.time() + 1.0  # shared wall-clock start (align all workers)
+        read_tasks = [(args.socket, _db, query_sqls, t_start, args.rw_duration,
+                       args.rw_sample_every, args.k, args.rw_read_uncommitted)
+                      for _ in range(nR)]
+        id_block = 10_000_000  # disjoint id range per writer (no PK collision)
+        write_tasks = [(args.socket, _db, args.dim, args.rw_write_batch,
+                        args.rw_write_delay, t_start, args.rw_write_start,
+                        args.rw_write_duration, args.n + w * id_block, 1000 + w)
+                       for w in range(nW)]
+
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(processes=nR + nW)  # readers + writers run concurrently
+        try:
+            read_async = pool.map_async(_rw_read_worker, read_tasks)
+            write_async = pool.map_async(_rw_write_worker, write_tasks)
+            read_results = read_async.get()
+            write_results = write_async.get()
+        finally:
+            pool.close()
+            pool.join()
+
+        # Per-second QPS: diff each reader's cumulative samples, bin by end-second.
+        per_sec = {}
+        for samples in read_results:
+            prev_n = 0
+            for (cnt, ts) in samples:
+                per_sec[int(math.floor(ts))] = (
+                    per_sec.get(int(math.floor(ts)), 0) + (cnt - prev_n))
+                prev_n = cnt
+        total_reads = sum((s[-1][0] if s else 0) for s in read_results)
+        wrote = sum(r[0] for r in write_results if r)
+        werrs = [r[1] for r in write_results if r and r[1]]
+
+        # Bin [0, duration) exclusive: the final partial second (queries stamped
+        # right at/after the deadline) lands in bucket floor(duration), which is
+        # an incomplete interval and would show a spuriously low QPS -- drop it.
+        secs = list(range(0, int(math.floor(args.rw_duration))))
+        qps_series = [per_sec.get(s, 0) for s in secs]
+        ws, we = args.rw_write_start, args.rw_write_start + args.rw_write_duration
+
+        print(f"\n=== rw-bench: {nR} readers x {args.rw_duration:.0f}s, "
+              f"{nW} writers @[{ws:.0f}-{we:.0f}]s delay={args.rw_write_delay} "
+              f"batch={args.rw_write_batch} ===")
+        print(f"total reads={total_reads}  writes={wrote} rows"
+              f"{'  WRITE ERRORS: ' + str(werrs[:2]) if werrs else ''}")
+        peak = max(qps_series) or 1
+        blocks = "▁▂▃▄▅▆▇█"
+        spark = "".join(blocks[min(7, int(q / peak * 7))] for q in qps_series)
+        print(f"peak {peak} qps  |{spark}|")
+        # read-only vs read+write mean QPS -- only meaningful when writers ran.
+        # (skip second 0: partial warmup bucket.)
+        if nW > 0 and nR > 0:
+            ro = [q for s, q in zip(secs, qps_series) if not (ws <= s < we) and 0 < s]
+            rw = [q for s, q in zip(secs, qps_series) if ws <= s < we]
+            ro_m = (sum(ro) / len(ro)) if ro else 0
+            rw_m = (sum(rw) / len(rw)) if rw else 0
+            if ro_m > 0:
+                print(f"read-only mean={ro_m:.0f} qps  read+write mean={rw_m:.0f} "
+                      f"qps  impact={100*(1-rw_m/ro_m):.0f}% drop")
+        print(f"{'sec':>4} {'qps':>7}  {'phase':<12}")
+        for s, q in zip(secs, qps_series):
+            phase = "read+WRITE" if ws <= s < we else "read-only"
+            print(f"{s:>4} {q:>7}  {phase:<12} {'#' * int(q / peak * 40)}")
+        if args.rw_csv:
+            with open(args.rw_csv, "w") as f:
+                f.write("second,qps,phase\n")
+                for s, q in zip(secs, qps_series):
+                    f.write(f"{s},{q},{'read+write' if ws <= s < we else 'read-only'}\n")
+            print(f"wrote CSV -> {args.rw_csv}")
+        return 0
 
     # Ground truth is ef_search-independent — compute once. TIE-TOLERANT
     # (ann-benchmarks-style): the "acceptable" set per query = ids whose TRUE
