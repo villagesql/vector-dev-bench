@@ -95,6 +95,25 @@ PROFILES = {
             "cosine": {"idx_modifier": "", "dist_fn": "vec_distance_cosine(v, {qlit})"},
         },
     },
+    # VARCHAR control -- NOT a vector engine. A plain wide VARCHAR column on the
+    # SAME server, storing each vector as its text literal ('[...]'), NO custom
+    # column, NO index, NO extension involvement. It reuses the harness's exact
+    # insert path (same sharding, batching, --build-threads multiprocessing), so
+    # it isolates the harness's insert code from the server's SVECTOR/custom-
+    # column path: run `--profile varchar_ctrl --build-only` and if it loses rows
+    # under --build-threads, the bug is the harness; if it's clean while
+    # vsql_vector loses rows, the bug is server-side. Build/insert-only -- it
+    # cannot answer KNN queries, so it has no metrics/index (use --build-only).
+    # varchar_len is sized in main() from dim (a dim-d int vector's '[...]' text).
+    "varchar_ctrl": {
+        "extension": None,
+        "coltype": "VARCHAR({varchar_len})",
+        "vec_literal": "'{lit}'",           # store the '[...]' text verbatim
+        # No index, no ef_search, no metrics -- build/insert-only control.
+        "metrics": {
+            "l2": {"idx_modifier": "", "dist_fn": "1"},  # placeholder; unused
+        },
+    },
     # pgvector (PostgreSQL) -- neutral third HNSW reference. Talks psql (client
     #="psql"); started by start_postgres.sh (scratch cluster, CREATE EXTENSION
     # vector, db "bench"). Build knobs m/ef_construction match ours (unlike
@@ -309,6 +328,38 @@ def _reader_run(sql_text):
     return lines
 
 
+def _insert_run(args):
+    """One concurrent INSERTER task (separate OS process). Owns its connection's
+    FULL lifecycle: open -> insert its shard (independent per-batch INSERTs, not
+    one mega-statement) -> commit -> close. Closing the connection inside the task
+    is the commit barrier: when pool.map() returns, every worker connection is
+    closed, so every insert is committed and durable BEFORE the parent counts
+    rows -- no race between the tail commits and the COUNT(*). (This is why
+    inserts do NOT share the reader's persistent pool connection: readers want the
+    connection open across the timed region; inserters need close-as-commit.)
+    Drives PARALLEL INDEX BUILD from the client side (N connections inserting into
+    the same table+index concurrently) to test whether the graph absorbs
+    concurrent inserts, isolating it from the server's internal parallel-DDL.
+    `args` = (socket, stmts). Returns (rows_executed, error): error is None on
+    success, else the exception string of the FIRST failing batch."""
+    socket, stmts = args
+    conn = _new_mysql_conn(socket)  # autocommit(True) inside
+    n = 0
+    try:
+        cur = conn.cursor()
+        for stmt in stmts:
+            try:
+                cur.execute(stmt)
+            except Exception as e:  # noqa: BLE001 -- surface any insert error
+                return (n, str(e))
+            if cur.rowcount and cur.rowcount > 0:
+                n += cur.rowcount
+        conn.commit()  # redundant under autocommit, but makes the barrier explicit
+        return (n, None)
+    finally:
+        conn.close()   # <- commit barrier: rows durable once this returns
+
+
 def run_sql(client_bin, socket, sql, want_rows=False):
     """Run SQL via the active client. `client_bin` is used only for the psql
     path; the MySQL path uses a persistent PyMySQL connection. `socket` is a
@@ -521,6 +572,25 @@ def main():
                          "subtract it (or compare) to isolate the actual search "
                          "cost. Combine with --readers N to measure dispatch "
                          "scaling. Recall is meaningless in dry-run (ignored).")
+    ap.add_argument("--build-threads", type=int, default=1,
+                    help="number of concurrent CLIENT connections for the insert/"
+                         "build phase (default 1 = serial). N>1 shards the rows "
+                         "across N OS processes, each inserting its shard into the "
+                         "SAME table+index concurrently -- drives parallel index "
+                         "build FROM THE CLIENT (bypasses the server's internal "
+                         "innodb_ddl_threads/parallel_read_threads). Use to test "
+                         "whether the graph absorbs concurrent inserts. "
+                         "incremental mode + mysql only. After the run the harness "
+                         "checks row count and recall -- a broken concurrent build "
+                         "shows as a recall collapse.")
+    ap.add_argument("--build-only", action="store_true",
+                    help="build the table+index and STOP -- report build time and "
+                         "the actual row count, run NO queries. Unlike --queries 0 "
+                         "(which the --dataset path silently rewrites to 'all test "
+                         "queries'), this genuinely skips the query phase, so it "
+                         "isolates the insert/build (e.g. to test --build-threads "
+                         "concurrent inserts without a slow KNN read phase "
+                         "afterwards). Recall is not computed.")
     ap.add_argument("--readers", type=int, default=1,
                     help="number of concurrent reader threads for the query "
                          "phase (default 1 = the original serial path). N>1 "
@@ -610,7 +680,10 @@ def main():
         data = rng.standard_normal((args.n, args.dim)).astype(np.float32)
         queries = rng.standard_normal((args.queries, args.dim)).astype(np.float32)
 
-    coltype = prof["coltype"].format(dim=args.dim)
+    # VARCHAR control sizes its column to hold a dim-d vector's '[...]' text:
+    # up to ~ (max-int-chars + comma) per element, plus brackets. Generous cap.
+    varchar_len = max(64, args.dim * 12 + 4)
+    coltype = prof["coltype"].format(dim=args.dim, varchar_len=varchar_len)
     # index_ddl only exists for the separate-CREATE-INDEX profiles; profiles with
     # a full table_ddl (e.g. mariadb) don't have it.
     index_ddl = (prof["index_ddl"].format(
@@ -677,12 +750,69 @@ CREATE DATABASE recall_bench; USE recall_bench;
     # statement-parse cost constant across N, isolating server insert/index cost
     # from harness SQL-parse cost. ---
     bs = args.insert_batch if args.insert_batch and args.insert_batch > 0 else args.n
-    t0 = time.time()
-    for start in range(0, args.n, bs):
-        rows = ",\n".join(f"({i}, {lit(data[i])})"
-                          for i in range(start, min(start + bs, args.n)))
-        run_sql(args.mysql, args.socket, f"{use_prefix} INSERT INTO t VALUES\n{rows};")
-    insert_s = time.time() - t0
+
+    def _insert_batch_stmts(row_range):
+        # Build a LIST of independent per-batch INSERT statements for a contiguous
+        # row range (one statement per --insert-batch rows), NOT one joined blob.
+        # The worker executes them one at a time, so each is a normal separately-
+        # parsed INSERT (same shape as the serial path).
+        stmts = []
+        lo, hi = row_range
+        for start in range(lo, hi, bs):
+            rows = ",\n".join(f"({i}, {lit(data[i])})"
+                              for i in range(start, min(start + bs, hi)))
+            stmts.append(f"{use_prefix} INSERT INTO t VALUES\n{rows}")
+        return stmts
+
+    build_threads = (args.build_threads
+                     if args.build_threads > 1 and CLIENT != "psql" else 1)
+    if args.build_threads > 1 and CLIENT == "psql":
+        print("NOTE: --build-threads is mysql-only; using serial insert for psql.")
+
+    if build_threads > 1:
+        # CLIENT-DRIVEN parallel build: shard rows across N OS processes, each
+        # inserting its contiguous shard into the SAME table+index concurrently.
+        # In incremental mode the index already exists (created in setup), so each
+        # INSERT triggers per-row graph maintenance -- this exercises the graph's
+        # CONCURRENT-insert path, isolating it from the server's internal
+        # parallel-DDL. Each worker OWNS its connection (open->insert->commit->
+        # close inside _insert_run), so when pool.map() returns, every insert is
+        # committed and durable -- the COUNT(*) that follows is exact, no race.
+        import multiprocessing as mp
+        edges = [round(k * args.n / build_threads) for k in range(build_threads + 1)]
+        shards = [(edges[k], edges[k + 1]) for k in range(build_threads)]
+        shards = [s for s in shards if s[1] > s[0]]
+        # Each task = (socket, list-of-per-batch-INSERT-statements). The worker
+        # opens its own connection from the socket (no shared pool connection).
+        tasks = [(args.socket, _insert_batch_stmts(s)) for s in shards]
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(processes=len(tasks))
+        try:
+            t0 = time.time()
+            worker_results = pool.map(_insert_run, tasks)  # timed region
+            insert_s = time.time() - t0
+        finally:
+            pool.close()
+            pool.join()
+        errs = [r for r in worker_results if r and r[1] is not None]
+        for r in errs:
+            print(f"  build-threads worker error (shard rows_done={r[0]}): {r[1]}")
+        # Authoritative correctness gate: the ACTUAL committed row count. All
+        # worker connections are closed (pool.map returned), so every insert is
+        # durable -- a single fresh read is exact, no poll/settle needed.
+        cnt = run_sql(args.mysql, args.socket,
+                      f"{use_prefix} SELECT COUNT(*) FROM t;", want_rows=True)
+        got = int(cnt[0]) if cnt else -1
+        status = "OK" if got == args.n and not errs else "MISMATCH!"
+        print(f"  build-threads={build_threads}: {got}/{args.n} rows committed "
+              f"{status}{' (worker errors above)' if errs else ''}")
+    else:
+        t0 = time.time()
+        for start in range(0, args.n, bs):
+            rows = ",\n".join(f"({i}, {lit(data[i])})"
+                              for i in range(start, min(start + bs, args.n)))
+            run_sql(args.mysql, args.socket, f"{use_prefix} INSERT INTO t VALUES\n{rows};")
+        insert_s = time.time() - t0
 
     # 'post' mode: the index does NOT exist yet — build it now (bulk), timed
     # separately so insert vs index cost is visible.
@@ -696,6 +826,23 @@ CREATE DATABASE recall_bench; USE recall_bench;
     # For 'post' mode show the split (insert vs bulk CREATE INDEX); it IS the
     # point of the mode. Empty in incremental mode.
     split = (f" [insert={insert_s:.2f} index={index_s:.2f}]" if post_index else "")
+
+    if args.build_only:
+        # Insert/build done. Report build time + actual row count and STOP -- no
+        # query phase, no ground truth. (Unlike --queries 0, which the --dataset
+        # path rewrites to 'all queries', this genuinely runs zero queries, so it
+        # isolates the concurrent insert.) A short concurrent build = lost rows.
+        if CLIENT == "psql":
+            cnt = run_sql(args.mysql, args.socket, "SELECT COUNT(*) FROM t;",
+                          want_rows=True)
+        else:
+            cnt = run_sql(args.mysql, args.socket,
+                          f"{use_prefix} SELECT COUNT(*) FROM t;", want_rows=True)
+        got = int(cnt[0]) if cnt else -1
+        ok = "OK" if got == args.n else f"MISMATCH (expected {args.n})"
+        print(f"build_time_s={build_s:.2f}{split}  rows={got}/{args.n} {ok}  "
+              f"(build-only; no queries)")
+        return 0 if got == args.n else 1
 
     # Ground truth is ef_search-independent — compute once. TIE-TOLERANT
     # (ann-benchmarks-style): the "acceptable" set per query = ids whose TRUE
