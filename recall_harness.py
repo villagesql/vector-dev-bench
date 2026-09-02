@@ -499,6 +499,28 @@ def main():
                          "rebuild needed). Overrides --ef-search.")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--emit-queries", default=None, metavar="FILE",
+                    help="write the real per-query KNN SELECT statements (one "
+                         "per line, real vector literals baked in) to FILE and "
+                         "exit -- for feeding a native load driver (mysqlslap "
+                         "-q FILE / sysbench) the EXACT query the harness "
+                         "validates. Builds the index first (so the table+index "
+                         "exist for the driver to hit), does NOT run the query "
+                         "phase. Use with --keep-server to leave the server up.")
+    ap.add_argument("--keep-server", action="store_true",
+                    help="after build (and --emit-queries), leave the server "
+                         "running and the table+index in place so an external "
+                         "load driver can hit the warmed instance. Prints the "
+                         "socket/table and exits without dropping anything.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="replace the KNN search query with a trivial "
+                         "'SELECT id FROM t LIMIT k' (no ORDER BY -> no HNSW "
+                         "search). Same statement count, round-trips, and "
+                         "process/connection dispatch as a real run, so the "
+                         "reported QPS is the harness+round-trip FLOOR -- "
+                         "subtract it (or compare) to isolate the actual search "
+                         "cost. Combine with --readers N to measure dispatch "
+                         "scaling. Recall is meaningless in dry-run (ignored).")
     ap.add_argument("--readers", type=int, default=1,
                     help="number of concurrent reader threads for the query "
                          "phase (default 1 = the original serial path). N>1 "
@@ -707,6 +729,24 @@ CREATE DATABASE recall_bench; USE recall_bench;
             # Component-namespaced name UNQUOTED (backticks crash the server).
             run_sql(args.mysql, args.socket, f"SET GLOBAL {prof['ef_search_var']} = {ef};")
 
+    def _one_query_stmt(qi):
+        # The per-query SELECT. --dry-run replaces the real KNN search with a
+        # server-TRIVIAL statement (a single constant row, NO table access at
+        # all) so the reported QPS reflects the pure harness+transport floor
+        # (process/connection dispatch, round-trip, sentinel/result parsing).
+        # NOTE: an earlier version used "SELECT id FROM t LIMIT k" -- that was a
+        # mistake: on a 60k x 784 table even a LIMIT-10 scan costs ~160us of
+        # SERVER work (clustered-index / column-store touch), so it measured
+        # cheap-query cost, not dispatch. A bare "SELECT 1" is ~20us and is the
+        # true floor. Result shape differs (1 row, not k) but recall is
+        # meaningless in dry-run anyway (ignored by callers), and the parser just
+        # sees a non-@@Q digit row per query, which is fine.
+        if args.dry_run:
+            return "SELECT 1;"
+        dist = metric["dist_fn"].format(qlit=lit(queries[qi]))
+        order = metric.get("order", "")
+        return f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};"
+
     def run_queries(ef=None):
         # All queries in ONE connection (one process spawn) so QPS isn't
         # dominated by client startup. Sentinel SELECT delimits each query.
@@ -718,10 +758,8 @@ CREATE DATABASE recall_bench; USE recall_bench;
         else:
             parts = [use_prefix]
         for qi in range(args.queries):
-            dist = metric["dist_fn"].format(qlit=lit(queries[qi]))
             parts.append(f"SELECT '@@Q{qi}' AS m;")
-            order = metric.get("order", "")
-            parts.append(f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};")
+            parts.append(_one_query_stmt(qi))
         t = time.time()
         out = run_sql(args.mysql, args.socket, "\n".join(parts), want_rows=True)
         qsec = time.time() - t
@@ -742,11 +780,9 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # can be split back into per-query id lists during scoring. Mirrors
         # run_queries()'s statement shape exactly (so recall is identical).
         parts = [use_prefix]
-        order = metric.get("order", "")
         for qi in qids:
-            dist = metric["dist_fn"].format(qlit=lit(queries[qi]))
             parts.append(f"SELECT '@@Q{qi}' AS m;")
-            parts.append(f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};")
+            parts.append(_one_query_stmt(qi))
         return "\n".join(parts)
 
     def run_queries_parallel(ef, nreaders):
@@ -792,6 +828,38 @@ CREATE DATABASE recall_bench; USE recall_bench;
         qps = args.queries / qsec if qsec > 0 else float("inf")
         return hits / (args.queries * args.k), qps
 
+    if args.emit_queries:
+        # Write the REAL per-query KNN SELECTs (one per line, no @@Q sentinel --
+        # a load driver just runs the query) for mysqlslap -q FILE / sysbench.
+        # Same _one_query_stmt() the recall path validates, so the driver runs
+        # the exact query we checked. ef_search is a GLOBAL: set it on the server
+        # (set_ef) so any connection the driver opens inherits it. Index is
+        # already built above, so the table+index exist for the driver to hit.
+        set_ef(args.ef_search if args.ef_search is not None
+               else (sweep[0] if sweep else None))
+        with open(args.emit_queries, "w") as f:
+            for qi in range(args.queries):
+                # Keep the trailing ';' -- mysqlslap -q FILE splits the file into
+                # statements on --delimiter=';', so each query MUST end with it
+                # (without it, the whole file is read as one malformed statement).
+                f.write(_one_query_stmt(qi) + "\n")
+        print(f"emitted {args.queries} queries -> {args.emit_queries}")
+        print(f"  table 't' + HNSW index built (build_time_s={build_s:.2f}); "
+              f"ef_search set on server.")
+        print(f"  drive with e.g.:  mysqlslap -S {args.socket} -u root "
+              f"--create-schema=recall_bench --no-drop --delimiter=';' "
+              f"-q {args.emit_queries} -c <N> --number-of-queries=<TOTAL>")
+        if args.keep_server:
+            print(f"  KEEP-SERVER: server left running on {args.socket}; "
+                  f"table+index NOT dropped.")
+        return 0
+
+    if args.keep_server:
+        # Build + (optional) recall done; leave everything up for a load driver.
+        print(f"build_time_s={build_s:.2f}{split}  (--keep-server: server left "
+              f"up on {args.socket}, table 't' + index in place)")
+        return 0
+
     if args.queries == 0:
         # Build-only probe (e.g. a build without the optimizer, so KNN SELECT
         # won't route). Report build time; no queries, no recall.
@@ -809,10 +877,12 @@ CREATE DATABASE recall_bench; USE recall_bench;
         return (run_queries_parallel(ef, parallel_readers)
                 if parallel_readers > 1 else run_queries(ef))
 
+    dtag = "  DRY-RUN (no HNSW search; qps = harness+round-trip floor)" if args.dry_run else ""
+
     if sweep:
         # Build once, re-query at each ef_search value.
         rtag = f"  readers={parallel_readers} (aggregate qps)" if parallel_readers > 1 else ""
-        print(f"build_time_s={build_s:.2f}{split}  (index built once; sweeping ef_search){rtag}")
+        print(f"build_time_s={build_s:.2f}{split}  (index built once; sweeping ef_search){rtag}{dtag}")
         print(f"{'ef_search':<10} {'recall@'+str(args.k):<12} {'qps':<8}")
         worst = 1.0
         for ef in sweep:
@@ -820,6 +890,8 @@ CREATE DATABASE recall_bench; USE recall_bench;
             rec, qps = query_at(ef)     # psql: SET rides inside the query batch
             worst = min(worst, rec)
             print(f"{ef:<10} {rec:<12.4f} {qps:<8.1f}")
+        if args.dry_run:
+            return 0                    # recall gate is meaningless in dry-run
         return 0 if worst >= args.threshold else 1
 
     # single run
@@ -827,7 +899,9 @@ CREATE DATABASE recall_bench; USE recall_bench;
     recall, qps = query_at(args.ef_search)
     rtag = f"  readers={parallel_readers}" if parallel_readers > 1 else ""
     print(f"build_time_s={build_s:.2f}{split}  qps={qps:.1f}{rtag}  recall@{args.k}={recall:.4f}  "
-          f"threshold={args.threshold}")
+          f"threshold={args.threshold}{dtag}")
+    if args.dry_run:
+        return 0                        # recall gate is meaningless in dry-run
     if recall >= args.threshold:
         print("PASS"); return 0
     print("FAIL (recall below threshold)"); return 1
