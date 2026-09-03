@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_sweep.sh — build-time and/or scan (recall/QPS) sweep for ONE engine,
 # run cleanly: caffeinated (no machine sleep) and isolated (this is the only
-# DB server the script starts). Wraps recall_harness.py with the right start
+# DB server the script starts). Wraps recall_bench.py with the right start
 # script and client for the chosen engine.
 #
 # Usage:
@@ -73,7 +73,7 @@ case "$ENGINE" in
   *) echo "unknown ENGINE=$ENGINE" >&2; exit 2;;
 esac
 
-hb() { "$PY" "$HERE/recall_harness.py" --profile "$PROFILE" --metric "$METRIC" \
+hb() { "$PY" "$HERE/recall_bench.py" --profile "$PROFILE" --metric "$METRIC" \
         --dim "$DIM" --M "$M" --ef-construction "$EFC" --insert-batch 1000 \
         --mysql "$CLIENT" --socket "$SOCKET" "$@"; }
 

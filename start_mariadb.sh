@@ -1,12 +1,15 @@
 #!/bin/bash
-# start_mariadb.sh — boot the local MariaDB debug server on a scratch datadir,
-# for driving MariaDB's vector (MHNSW) index with the recall harness as an
-# in-database HNSW build-time reference vs vsql-vector.
-# Prints the socket path on success. Mirrors start_server.sh's scratch-dir model.
+# start_mariadb.sh — boot a MariaDB server on a scratch datadir for driving its
+# vector (MHNSW) index with the harness. Prints the socket path on success.
+# Mirrors start_server.sh's scratch-dir model.
 set -euo pipefail
 
-MB="${MB:-$HOME/githome/mariadb-server/build-debug}"
-SRC="${MARIADB_SRC:-$HOME/githome/mariadb-server}"
+# MB: MariaDB build tree OR installed package basedir. Point at your own, e.g.
+#   MB=/opt/homebrew/opt/mariadb@11.8            (Homebrew stock package)
+#   MB=/path/to/mariadb-server/build-release     (source build tree)
+# MARIADB_SRC: source dir (only needed for a build tree, for install-db scripts).
+MB="${MB:?set MB to your MariaDB basedir (build tree or installed package)}"
+SRC="${MARIADB_SRC:-$MB}"
 WORKDIR="${WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.run-maria}"
 DATADIR="$WORKDIR/data"
 SOCKET="$WORKDIR/mariadb.sock"
@@ -45,12 +48,12 @@ else
 fi
 
 echo "Starting mariadbd (socket=$SOCKET)..." >&2
-# MHNSW_CACHE_BYTES: size for MariaDB's HNSW graph cache. Its 16MB DEFAULT is far
-# too small for real datasets — on overflow MariaDB reset()s the graph context and
-# loses the learned stat that sizes its bloom-filter visited-set, degrading BOTH
-# build speed AND recall. Callers should pass ~max(512MB, 2 x N x dim x 4) so the
-# graph fits (the harness computes this and warns if it's too small). Unset = leave
-# MariaDB at its 16MB default.
+# MHNSW_CACHE_BYTES: size for MariaDB's HNSW graph cache. The 16MB default is
+# smaller than a real dataset's working graph; on overflow MariaDB reset()s the
+# graph context and loses the learned stat that sizes its bloom-filter visited-
+# set, which affects both build speed and recall. To size the cache to the graph,
+# pass ~max(512MB, 2 x N x dim x 4) (the harness computes this and warns if it is
+# too small). Unset = leave MariaDB at its 16MB default.
 MHNSW_ARG=""
 [ -n "${MHNSW_CACHE_BYTES:-}" ] && MHNSW_ARG="--mhnsw-max-cache-size=${MHNSW_CACHE_BYTES}"
 # MARIADBD_EXTRA: optional extra args (e.g. --innodb-buffer-pool-size=4G) for

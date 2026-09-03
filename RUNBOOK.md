@@ -107,7 +107,7 @@ ef_search means the index is NOT being used (full-scan fallback).
 
 ```bash
 SRV_BUILD=<...> EXTENSIONS=vsql_vector bash start_server.sh
-python recall_harness.py --profile vsql_vector --metric l2 --dim 32 --n 2000 \
+python recall_bench.py --profile vsql_vector --metric l2 --dim 32 --n 2000 \
   --queries 20 -k 10 --M 8 --ef-construction 100 --ef-search 100 \
   --mysql <...>/runtime_output_directory/mysql
 # expect: build_time_s=..., recall@10 around 0.95-1.0, no ERROR

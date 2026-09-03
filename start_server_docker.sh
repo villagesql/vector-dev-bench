@@ -9,7 +9,7 @@
 # Mirrors start_server.sh / start_postgres.sh: fresh state each run, prints the
 # connection spec on success. But it prints a TCP host/port (not a socket),
 # because a container's unix socket lives inside the container. Drive the
-# harness with:  recall_harness.py --host 127.0.0.1 --port $PORT --mysql <client>
+# harness with:  recall_bench.py --host 127.0.0.1 --port $PORT --mysql <client>
 #
 # Env:
 #   IMAGE   REQUIRED. The image to run, e.g.

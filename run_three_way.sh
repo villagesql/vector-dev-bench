@@ -16,10 +16,11 @@
 # METRIC, QUERIES, K, BUF, REPS. Defaults inherited from run_sweep.sh.
 #
 # NOTE ASYMMETRIES the numbers carry (state them in any writeup):
-#   - MariaDB ignores EFC (hardcoded ef_construction=10 upstream) — it builds a
-#     cheaper/lower-quality graph than vsql/pgvector at EFC>10.
-#   - pgvector's NATIVE build is bulk `CREATE INDEX`; here it is driven
-#     incrementally (index present during insert), its worst path. See RUNBOOK.
+#   - MariaDB ignores EFC (hardcoded ef_construction=10 upstream), so at EFC>10
+#     it builds with a different (lower) construction budget than the others.
+#   - pgvector's native fast path is a bulk `CREATE INDEX`; here every engine is
+#     driven incrementally (index present during insert) for an apples-to-apples
+#     build model. This is not pgvector's fastest path. See RUNBOOK.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
