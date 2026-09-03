@@ -39,6 +39,16 @@ own thing. They share the same `--profile`/`--metric`/`--dim`/`--n`/`--M`/
 | `mariadb`      | MariaDB MHNSW             | mariadb| `Vec_FromText` | inline `VECTOR INDEX` |
 | `pgvector`     | PostgreSQL + pgvector     | psql   | text `'[...]'` | `CREATE INDEX ... USING hnsw` |
 
+> **Client note (fairness).** The `client` column names the SQL *dialect*, not the
+> transport. `vsql_vector` and `mariadb` both speak the MySQL protocol and are
+> driven by the **same PyMySQL code path** — identical connection setup, batching,
+> and result handling; only the emitted SQL differs. So any client-side overhead is
+> symmetric between them and cancels out in relative comparison. `pgvector` is the
+> one asymmetric client: it shells out to the `psql` CLI. (The `--mysql` flag is
+> therefore vestigial for the query path — PyMySQL drives it regardless of which
+> `mysql`/`mariadb` binary you point at; the flag still feeds the `start_*.sh`
+> scripts and config reporting.)
+
 ## What this is NOT
 
 This is the **development** harness. For a rigorous, external-facing comparison
