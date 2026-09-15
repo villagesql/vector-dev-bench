@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 """
 rw_bench.py — READ-UNDER-WRITE benchmark for the VillageSQL vector index. Builds
 the index, then runs a timed KNN read load (--readers threads, --rw-duration

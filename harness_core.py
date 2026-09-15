@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 """
 harness_core.py — shared infrastructure for the VillageSQL vector-index
 benchmarks. Owns the engine "profiles" (SQL surfaces), connection handling,

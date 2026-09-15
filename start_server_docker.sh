@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # start_server_docker.sh -- boot a vector-bench engine from a prebuilt DOCKER
 # IMAGE (e.g. one pulled from the registry) and expose it over TCP for the
 # recall harness. The container's own entrypoint installs the extension + sets

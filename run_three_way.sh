@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # run_three_way.sh — vsql vs MariaDB vs pgvector, ONE ENGINE AT A TIME.
 #
 # Runs run_sweep.sh once per engine so only one DB server is ever live (each

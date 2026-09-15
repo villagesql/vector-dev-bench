@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 """
 recall_bench.py — recall + QPS tester for VillageSQL custom KNN vector indexes.
 Generates or loads vectors, builds the custom index, runs KNN queries via the

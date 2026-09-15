@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # run_sweep.sh — build-time and/or scan (recall/QPS) sweep for ONE engine,
 # run cleanly: caffeinated (no machine sleep) and isolated (this is the only
 # DB server the script starts). Wraps recall_bench.py with the right start
