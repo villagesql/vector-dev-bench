@@ -25,9 +25,16 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ENGINES="${ENGINES:-vsql mariadb pgvector}"
+failed=""
 for eng in $ENGINES; do
   echo "======================== $eng ========================"
-  ENGINE="$eng" bash "$HERE/run_sweep.sh"
+  if ! ENGINE="$eng" bash "$HERE/run_sweep.sh"; then
+    failed="$failed $eng"
+  fi
   echo
 done
+if [ -n "$failed" ]; then
+  echo "FAILED:$failed" >&2
+  exit 1
+fi
 echo "ALL DONE"

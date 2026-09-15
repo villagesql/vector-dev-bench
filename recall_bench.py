@@ -66,6 +66,12 @@ def main():
                          "then re-queries at each (ef_search is query-time, so no "
                          "rebuild needed). Overrides --ef-search.")
     ap.add_argument("--threshold", type=float, default=0.95)
+    ap.add_argument("--no-gate", action="store_true",
+                    help="report recall but always exit 0 (do NOT fail when "
+                         "recall < threshold). Use for cross-engine comparison "
+                         "sweeps, where a lower recall is a result to report, not "
+                         "a harness failure. Without this, recall < threshold "
+                         "exits 1 so the run is usable as a single-engine gate.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--emit-queries", default=None, metavar="FILE",
                     help="write the real per-query KNN SELECT statements (one "
@@ -355,8 +361,8 @@ def main():
             rec, qps = query_at(ef)     # psql: SET rides inside the query batch
             worst = min(worst, rec)
             print(f"{ef:<10} {rec:<12.4f} {qps:<8.1f}")
-        if args.dry_run:
-            return 0                    # recall gate is meaningless in dry-run
+        if args.dry_run or args.no_gate:
+            return 0                    # report-only (dry-run / comparison sweep)
         return 0 if worst >= args.threshold else 1
 
     # single run
@@ -365,8 +371,8 @@ def main():
     rtag = f"  readers={parallel_readers}" if parallel_readers > 1 else ""
     print(f"build_time_s={build_s:.2f}{split}  qps={qps:.1f}{rtag}  recall@{args.k}={recall:.4f}  "
           f"threshold={args.threshold}{dtag}")
-    if args.dry_run:
-        return 0                        # recall gate is meaningless in dry-run
+    if args.dry_run or args.no_gate:
+        return 0                        # report-only (dry-run / comparison sweep)
     if recall >= args.threshold:
         print("PASS"); return 0
     print("FAIL (recall below threshold)"); return 1
