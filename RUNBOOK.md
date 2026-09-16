@@ -97,6 +97,28 @@ clean reference.
 brew install postgresql@17 pgvector     # -> PGBIN=/opt/homebrew/opt/postgresql@17/bin
 ```
 
+### Google MySQL 9.x + ScaNN (`google` profile)
+
+Google's native `VECTOR` type + ScaNN approximate index. Needs a Google MySQL
+build and the ScaNN runtime lib; `start_gv.sh` boots a scratch server with the
+required `--cloudsql-vector=ON` flag and `libscann.so` on `LD_LIBRARY_PATH`.
+
+```bash
+GV_BUILD=/path/to/google-mysql/build \
+SCANN_LIB=/path/to/dir/with/libscann.so \
+  bash start_gv.sh                        # boots on .run-gv/mysqld.sock
+
+# ScaNN is a TRAINED index: it must be built AFTER the data is loaded (needs
+# >=1000 rows to train), so use --index-mode post. The knob is
+# num_leaves_to_search (swept via --ef-search-sweep).
+python recall_bench.py --profile google --dataset fashion-mnist-784-euclidean \
+  --queries 1000 -k 10 --index-mode post --ef-search-sweep 10,50,100,200 \
+  --mysql $GV_BUILD/bin/mysql --socket .run-gv/mysqld.sock
+# NOTE: ScaNN quantizes vectors, so recall plateaus BELOW 1.0 (~0.997 on
+# fashion-mnist) even at high num_leaves — unlike the exact-vector HNSW engines.
+kill "$(cat .run-gv/mysqld.pid)"
+```
+
 ---
 
 ## 2. Sanity smoke (always do this first after a rebuild)
