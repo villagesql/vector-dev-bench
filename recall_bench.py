@@ -198,7 +198,24 @@ def main():
         # for call-site symmetry).
         return
 
-    def _one_query_stmt(qi):
+    # How this engine takes the ef-search parameter, declared per profile:
+    #   {"style": "set", "var": NAME} -- a separate `SET` statement before the
+    #       queries (a session/GUC variable the query then reads implicitly).
+    #   {"style": "inline"}           -- passed inside the query itself; the
+    #       metric's dist_fn carries an {ef} placeholder.
+    ef_param = prof.get("ef_param", {})
+    ef_inline = ef_param.get("style") == "inline"
+
+    def ef_set_stmt(ef):
+        # The SET statement for a "set"-style ef param, or "" (empty) for an
+        # inline param / no ef. psql omits the SESSION keyword (session GUC);
+        # the mysql family uses SET SESSION.
+        if ef is None or ef_param.get("style") != "set":
+            return ""
+        kw = "" if core.CLIENT == "psql" else "SESSION "
+        return f"SET {kw}{ef_param['var']} = {ef};"
+
+    def _one_query_stmt(qi, ef=None):
         # The per-query SELECT. --dry-run replaces the real KNN search with a
         # server-TRIVIAL statement (a single constant row, NO table access at
         # all) so the reported QPS reflects the pure harness+transport floor
@@ -212,27 +229,24 @@ def main():
         # sees a non-@@Q digit row per query, which is fine.
         if args.dry_run:
             return "SELECT 1;"
-        dist = metric["dist_fn"].format(qlit=lit(queries[qi]))
+        fmt = {"qlit": lit(queries[qi])}
+        if ef_inline:
+            fmt["ef"] = ef if ef is not None else args.ef_search
+        dist = metric["dist_fn"].format(**fmt)
         order = metric.get("order", "")
         return f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};"
 
     def run_queries(ef=None):
         # All queries in ONE connection (one process spawn) so QPS isn't
-        # dominated by client startup. Sentinel SELECT delimits each query.
-        # ef_search is a SESSION variable, so the SET must ride INSIDE this batch
-        # to apply to the connection that runs the queries (each run_sql is a
-        # fresh connection). psql uses `SET name = v`; the mysql family uses
-        # `SET SESSION name = v` (component-namespaced name UNQUOTED -- backticks
-        # crash the server).
-        if ef is None:
-            parts = []
-        elif core.CLIENT == "psql":
-            parts = [f"SET {prof['ef_search_var']} = {ef};"]
-        else:
-            parts = [f"SET SESSION {prof['ef_search_var']} = {ef};"]
+        # dominated by client startup. Sentinel SELECT delimits each query. A
+        # "set"-style ef param must ride INSIDE this batch to apply to the query
+        # connection (each run_sql is a fresh connection); an inline param is
+        # already in each query, so ef_set_stmt() returns "".
+        stmt = ef_set_stmt(ef)
+        parts = [stmt] if stmt else []
         for qi in range(args.queries):
             parts.append(f"SELECT '@@Q{qi}' AS m;")
-            parts.append(_one_query_stmt(qi))
+            parts.append(_one_query_stmt(qi, ef))
         t = time.time()
         out = core.run_sql(args.mysql, args.socket, "\n".join(parts), want_rows=True)
         qsec = time.time() - t
@@ -247,7 +261,7 @@ def main():
                    for qi in range(args.queries))
         return hits / (args.queries * args.k), args.queries / qsec if qsec > 0 else float("inf")
 
-    def _build_query_sql(qids):
+    def _build_query_sql(qids, ef=None):
         # Build one `;`-batched statement string for the given query indices.
         # Each query is preceded by a '@@Q<i>' sentinel SELECT so the raw output
         # can be split back into per-query id lists during scoring. Mirrors
@@ -255,7 +269,7 @@ def main():
         parts = []
         for qi in qids:
             parts.append(f"SELECT '@@Q{qi}' AS m;")
-            parts.append(_one_query_stmt(qi))
+            parts.append(_one_query_stmt(qi, ef))
         return "\n".join(parts)
 
     def run_queries_parallel(ef, nreaders):
@@ -271,15 +285,11 @@ def main():
         # Contiguous shards keep each worker's batch a similar size.
         shards = [qids[i::nreaders] for i in range(nreaders)]
         shards = [s for s in shards if s]           # drop empties if readers>queries
-        # ef_search is SESSION-scoped, so each reader must set it on its own
-        # connection -- prepend the SET to every shard's batch.
-        if ef is None:
-            ef_prefix = ""
-        elif core.CLIENT == "psql":
-            ef_prefix = f"SET {prof['ef_search_var']} = {ef};\n"
-        else:
-            ef_prefix = f"SET SESSION {prof['ef_search_var']} = {ef};\n"
-        sql_batches = [ef_prefix + _build_query_sql(s) for s in shards]
+        # "set"-style engines set ef per reader connection (prefix the SET);
+        # inline-style engines carry ef inside each query (via _build_query_sql).
+        stmt = ef_set_stmt(ef)
+        ef_prefix = (stmt + "\n") if stmt else ""
+        sql_batches = [ef_prefix + _build_query_sql(s, ef) for s in shards]
 
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=len(sql_batches),
@@ -313,20 +323,22 @@ def main():
         # Write the REAL per-query KNN SELECTs (one per line, no @@Q sentinel --
         # a load driver just runs the query) for mysqlslap -q FILE / sysbench.
         # Same _one_query_stmt() the recall path validates, so the driver runs
-        # the exact query we checked. ef_search is SESSION-scoped, so it must be
-        # set per driver connection: the file opens with a `SET SESSION` that
-        # mysqlslap/sysbench runs on each of its `-c N` client connections. The
-        # index is already built above, so the table+index exist for the driver.
+        # the exact query we checked. For a "set"-style ef param the file opens
+        # with the SET (which mysqlslap/sysbench runs on each of its `-c N` client
+        # connections); for an inline param each emitted query already carries ef.
+        # The index is already built above, so the table+index exist for the
+        # driver.
         emit_ef = (args.ef_search if args.ef_search is not None
                    else (sweep[0] if sweep else None))
         with open(args.emit_queries, "w") as f:
-            if emit_ef is not None:
-                f.write(f"SET SESSION {prof['ef_search_var']} = {emit_ef};\n")
+            stmt = ef_set_stmt(emit_ef)
+            if stmt:
+                f.write(stmt + "\n")
             for qi in range(args.queries):
                 # Keep the trailing ';' -- mysqlslap -q FILE splits the file into
                 # statements on --delimiter=';', so each query MUST end with it
                 # (without it, the whole file is read as one malformed statement).
-                f.write(_one_query_stmt(qi) + "\n")
+                f.write(_one_query_stmt(qi, emit_ef) + "\n")
         print(f"emitted {args.queries} queries -> {args.emit_queries}")
         print(f"  table 't' + HNSW index built (build_time_s={build_s:.2f}); "
               f"ef_search={emit_ef} set per-connection (SET SESSION in file).")

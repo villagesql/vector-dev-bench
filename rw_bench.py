@@ -222,10 +222,13 @@ def main():
     if core.CLIENT == "psql":
         print("ERROR: rw_bench is mysql-only.", file=sys.stderr)
         return 2
-    # ef_search once, server-side GLOBAL (readers inherit it).
+    # ef_search once, server-side GLOBAL (readers inherit it). Only meaningful
+    # for "set"-style ef params; inline-param engines carry ef in the query.
     ef = args.ef_search if args.ef_search is not None else 100
-    core.run_sql(args.mysql, args.socket,
-                 f"SET GLOBAL {prof['ef_search_var']} = {ef};")
+    ef_param = prof.get("ef_param", {})
+    if ef_param.get("style") == "set":
+        core.run_sql(args.mysql, args.socket,
+                     f"SET GLOBAL {ef_param['var']} = {ef};")
     _db = "recall_bench"
     # Pre-build the read SQL pool; readers cycle through it. Built ONCE here,
     # outside the timed loop. --rw-read-sql overrides the KNN query with an
