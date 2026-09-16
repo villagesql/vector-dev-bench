@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # start_postgres.sh -- boot a scratch PostgreSQL cluster with pgvector for the
 # recall harness, as a neutral third HNSW reference (pgvector). Mirrors
 # start_server.sh / start_mariadb.sh: fresh datadir each run, unix socket only,

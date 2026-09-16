@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # start_mariadb.sh — boot a MariaDB server on a scratch datadir for driving its
 # vector (MHNSW) index with the harness. Prints the socket path on success.
 # Mirrors start_server.sh's scratch-dir model.

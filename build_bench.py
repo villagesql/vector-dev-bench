@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 """
 build_bench.py — index-BUILD benchmark for the VillageSQL vector index. Builds
 the table + index (serial or parallel via --build-threads) and reports build

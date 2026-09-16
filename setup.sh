@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # setup.sh — create the local Python venv and install the harness deps.
 #
 # One-time setup for a fresh clone:

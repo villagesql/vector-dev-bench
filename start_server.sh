@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 VillageSQL Contributors
+# SPDX-License-Identifier: Apache-2.0
 # start_server.sh — boot the local debug VillageSQL server on a scratch datadir
 # for the vsql-vector recall harness. Idempotent-ish: wipes+reinits the scratch
 # datadir each run so tests start clean. Prints the socket path on success.
