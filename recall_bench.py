@@ -189,16 +189,14 @@ def main():
             truth.append(set(np.nonzero(d <= thresh)[0].tolist()))
 
     def set_ef(ef):
-        if ef is None:
-            return
-        if core.CLIENT == "psql":
-            # pgvector GUC is session-scoped; a separate psql -c wouldn't persist
-            # to the query batch's connection, so it's folded into run_queries()
-            # instead. Nothing to do here.
-            return
-        else:
-            # Component-namespaced name UNQUOTED (backticks crash the server).
-            core.run_sql(args.mysql, args.socket, f"SET GLOBAL {prof['ef_search_var']} = {ef};")
+        # ef_search is SESSION-scoped for every engine (vsql_vector.ef_search,
+        # MariaDB mhnsw_ef_search, pgvector hnsw.ef_search), so it must be set on
+        # the SAME connection that runs the queries. Each core.run_sql() spawns a
+        # fresh client/connection, so a SET here would not carry over to the query
+        # batch -- the SET is folded into run_queries()/run_queries_parallel()
+        # instead, riding inside the query connection. Nothing to do here (kept
+        # for call-site symmetry).
+        return
 
     def _one_query_stmt(qi):
         # The per-query SELECT. --dry-run replaces the real KNN search with a
@@ -221,13 +219,17 @@ def main():
     def run_queries(ef=None):
         # All queries in ONE connection (one process spawn) so QPS isn't
         # dominated by client startup. Sentinel SELECT delimits each query.
-        # For psql the SET (session GUC) must ride INSIDE this same batch to
-        # persist across the queries (each run_sql is a fresh psql connection);
-        # for mysql ef is a GLOBAL already applied by set_ef(), so no prefix.
-        if core.CLIENT == "psql":
-            parts = [f"SET {prof['ef_search_var']} = {ef};"] if ef is not None else []
-        else:
+        # ef_search is a SESSION variable, so the SET must ride INSIDE this batch
+        # to apply to the connection that runs the queries (each run_sql is a
+        # fresh connection). psql uses `SET name = v`; the mysql family uses
+        # `SET SESSION name = v` (component-namespaced name UNQUOTED -- backticks
+        # crash the server).
+        if ef is None:
             parts = []
+        elif core.CLIENT == "psql":
+            parts = [f"SET {prof['ef_search_var']} = {ef};"]
+        else:
+            parts = [f"SET SESSION {prof['ef_search_var']} = {ef};"]
         for qi in range(args.queries):
             parts.append(f"SELECT '@@Q{qi}' AS m;")
             parts.append(_one_query_stmt(qi))
@@ -269,7 +271,15 @@ def main():
         # Contiguous shards keep each worker's batch a similar size.
         shards = [qids[i::nreaders] for i in range(nreaders)]
         shards = [s for s in shards if s]           # drop empties if readers>queries
-        sql_batches = [_build_query_sql(s) for s in shards]
+        # ef_search is SESSION-scoped, so each reader must set it on its own
+        # connection -- prepend the SET to every shard's batch.
+        if ef is None:
+            ef_prefix = ""
+        elif core.CLIENT == "psql":
+            ef_prefix = f"SET {prof['ef_search_var']} = {ef};\n"
+        else:
+            ef_prefix = f"SET SESSION {prof['ef_search_var']} = {ef};\n"
+        sql_batches = [ef_prefix + _build_query_sql(s) for s in shards]
 
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=len(sql_batches),
@@ -303,12 +313,15 @@ def main():
         # Write the REAL per-query KNN SELECTs (one per line, no @@Q sentinel --
         # a load driver just runs the query) for mysqlslap -q FILE / sysbench.
         # Same _one_query_stmt() the recall path validates, so the driver runs
-        # the exact query we checked. ef_search is a GLOBAL: set it on the server
-        # (set_ef) so any connection the driver opens inherits it. Index is
-        # already built above, so the table+index exist for the driver to hit.
-        set_ef(args.ef_search if args.ef_search is not None
-               else (sweep[0] if sweep else None))
+        # the exact query we checked. ef_search is SESSION-scoped, so it must be
+        # set per driver connection: the file opens with a `SET SESSION` that
+        # mysqlslap/sysbench runs on each of its `-c N` client connections. The
+        # index is already built above, so the table+index exist for the driver.
+        emit_ef = (args.ef_search if args.ef_search is not None
+                   else (sweep[0] if sweep else None))
         with open(args.emit_queries, "w") as f:
+            if emit_ef is not None:
+                f.write(f"SET SESSION {prof['ef_search_var']} = {emit_ef};\n")
             for qi in range(args.queries):
                 # Keep the trailing ';' -- mysqlslap -q FILE splits the file into
                 # statements on --delimiter=';', so each query MUST end with it
@@ -316,7 +329,7 @@ def main():
                 f.write(_one_query_stmt(qi) + "\n")
         print(f"emitted {args.queries} queries -> {args.emit_queries}")
         print(f"  table 't' + HNSW index built (build_time_s={build_s:.2f}); "
-              f"ef_search set on server.")
+              f"ef_search={emit_ef} set per-connection (SET SESSION in file).")
         print(f"  drive with e.g.:  mysqlslap -S {args.socket} -u root "
               f"--create-schema=recall_bench --no-drop --delimiter=';' "
               f"-q {args.emit_queries} -c <N> --number-of-queries=<TOTAL>")
@@ -357,8 +370,7 @@ def main():
         print(f"{'ef_search':<10} {'recall@'+str(args.k):<12} {'qps':<8}")
         worst = 1.0
         for ef in sweep:
-            set_ef(ef)                 # mysql: GLOBAL; psql: no-op (folded below)
-            rec, qps = query_at(ef)     # psql: SET rides inside the query batch
+            rec, qps = query_at(ef)     # ef is set per query connection (SESSION)
             worst = min(worst, rec)
             print(f"{ef:<10} {rec:<12.4f} {qps:<8.1f}")
         if args.dry_run or args.no_gate:
@@ -366,7 +378,6 @@ def main():
         return 0 if worst >= args.threshold else 1
 
     # single run
-    set_ef(args.ef_search)
     recall, qps = query_at(args.ef_search)
     rtag = f"  readers={parallel_readers}" if parallel_readers > 1 else ""
     print(f"build_time_s={build_s:.2f}{split}  qps={qps:.1f}{rtag}  recall@{args.k}={recall:.4f}  "
