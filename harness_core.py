@@ -62,7 +62,7 @@ PROFILES = {
         # query-time HNSW search breadth, settable via SQL. NOTE: read only via
         # SHOW VARIABLES / not `SELECT @@global.<name>` (that read path crashes
         # for extension-namespaced dotted sysvars — separate server bug).
-        "ef_search_var": "vsql_vector.ef_search",
+        "ef_param": {"style": "set", "var": "vsql_vector.ef_search"},
         # HNSW: metric is chosen by BOTH the index modifier (build) and the query fn
         "index_ddl": ("CREATE INDEX idx_v ON t (v {idx_modifier}) USING EXTENDED(hnsw) "
                       "WITH (M = {M}, ef_construction = {efc})"),
@@ -84,7 +84,7 @@ PROFILES = {
         "vec_literal": "Vec_FromText('{lit}')",
         # Query-time search breadth. MariaDB floors it to max_neighbours internally;
         # SET GLOBAL applies to the fresh per-query-batch connection.
-        "ef_search_var": "mhnsw_ef_search",
+        "ef_param": {"style": "set", "var": "mhnsw_ef_search"},
         # {idx_modifier} unused; M set inline. ef_construction ignored (fixed 10).
         "table_ddl": ("CREATE TABLE t (id INT PRIMARY KEY, v VECTOR({dim}) NOT NULL, "
                       "VECTOR INDEX (v) M={M}) ENGINE=InnoDB;"),
@@ -125,7 +125,7 @@ PROFILES = {
         "extension": None,
         "coltype": "vector({dim})",
         "vec_literal": "'{lit}'",           # '[...]' text cast implicitly to vector
-        "ef_search_var": "hnsw.ef_search",  # SET hnsw.ef_search = N (session GUC)
+        "ef_param": {"style": "set", "var": "hnsw.ef_search"},  # SET hnsw.ef_search = N (session GUC)
         # {idx_modifier} carries the HNSW opclass, which must match the query
         # operator/metric (l2 -> vector_l2_ops, etc.).
         "index_ddl": ("CREATE INDEX ON t USING hnsw (v {idx_modifier}) "
@@ -134,6 +134,28 @@ PROFILES = {
             "l2":     {"idx_modifier": "vector_l2_ops",     "dist_fn": "v <-> {qlit}"},
             "cosine": {"idx_modifier": "vector_cosine_ops", "dist_fn": "v <=> {qlit}"},
             "ip":     {"idx_modifier": "vector_ip_ops",     "dist_fn": "v <#> {qlit}"},
+        },
+    },
+    # Google MySQL 9.7 native VECTOR + ScaNN approximate index (WL#16081 /
+    # CloudSQL). VECTOR(N) type; literals via string_to_vector('[...]'); index
+    # is `CREATE VECTOR INDEX ... DISTANCE_MEASURE=<m>`; KNN is
+    # `ORDER BY APPROX_DISTANCE(v, qlit, 'options') LIMIT k`. The search-breadth
+    # knob (num_leaves_to_search) is passed INLINE inside APPROX_DISTANCE, so the
+    # ef_param style is "inline" and dist_fn carries an {ef} placeholder.
+    # Requires the ScaNN runtime (libscann.so) on the server's LD_LIBRARY_PATH.
+    "google": {
+        "extension": None,
+        "coltype": "VECTOR({dim})",
+        "vec_literal": "string_to_vector('{lit}')",
+        "ef_param": {"style": "inline"},
+        "index_ddl": "CREATE VECTOR INDEX vec_index ON t (v) DISTANCE_MEASURE={idx_modifier}",
+        "metrics": {
+            "l2":     {"idx_modifier": "l2_squared",
+                       "dist_fn": "APPROX_DISTANCE(v, {qlit}, 'distance_measure=l2_squared, num_leaves_to_search={ef}')"},
+            "cosine": {"idx_modifier": "cosine",
+                       "dist_fn": "APPROX_DISTANCE(v, {qlit}, 'distance_measure=cosine, num_leaves_to_search={ef}')"},
+            "ip":     {"idx_modifier": "dot_product", "order": "DESC",
+                       "dist_fn": "APPROX_DISTANCE(v, {qlit}, 'distance_measure=dot_product, num_leaves_to_search={ef}')"},
         },
     },
 }
@@ -546,7 +568,7 @@ def resolve_profile(args):
     sweep = None
     if getattr(args, "ef_search_sweep", None) is not None:
         sweep = [int(x) for x in args.ef_search_sweep.split(",") if x.strip()]
-    if (getattr(args, "ef_search", None) is not None or sweep) and "ef_search_var" not in prof:
+    if (getattr(args, "ef_search", None) is not None or sweep) and "ef_param" not in prof:
         print(f"ERROR: profile '{args.profile}' does not expose a query-time "
               f"ef_search knob.", file=sys.stderr)
         raise SystemExit(2)
