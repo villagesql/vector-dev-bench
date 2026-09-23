@@ -64,7 +64,9 @@ case "$ENGINE" in
     CLIENT="$SRV_BUILD/runtime_output_directory/mysql"
     SOCKET="$HERE/.run/mysqld.sock"
     start() { MYSQLD_EXTRA="--innodb-buffer-pool-size=$BUF" SRV_BUILD="$SRV_BUILD" \
-              EXTENSIONS="${EXTENSIONS:-vsql_vector}" bash "$HERE/start_server.sh" >/dev/null 2>&1; }
+              EXTENSIONS="${EXTENSIONS:-vsql_vector}" \
+              OPTIMIZER="${OPTIMIZER:-hypergraph}" \
+              bash "$HERE/start_server.sh" >/dev/null 2>&1; }
     stop()  { [ -f "$HERE/.run/mysqld.pid" ] && kill "$(cat "$HERE/.run/mysqld.pid")" 2>/dev/null; }
     ;;
   mariadb)

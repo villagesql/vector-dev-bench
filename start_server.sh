@@ -15,6 +15,11 @@
 #   SRV_BUILD    server build dir (REQUIRED unless the ../build fallback applies)
 #   WORKDIR      scratch dir for datadir/socket/logs (default bench/.run)
 #   EXTENSIONS   space-separated extension names to install (default vsql_vector)
+#   OPTIMIZER    which optimizer selects the custom KNN scan: "hypergraph"
+#                (default) or "classic". Historically only the hypergraph
+#                optimizer routed the KNN scan; a server with classic-optimizer
+#                support can be tested by setting OPTIMIZER=classic, which leaves
+#                hypergraph_optimizer OFF so the classic path is exercised.
 set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,16 +78,23 @@ MYSQL="$SRV_BUILD/runtime_output_directory/mysql"
 for i in $(seq 1 60); do
   if "$MYSQL" --no-defaults -uroot --socket="$SOCKET" -e "SELECT 1" >/dev/null 2>&1; then
     # Bake the custom-KNN gates in as SERVER-WIDE DEFAULTS so every connection
-    # (incl. the harness's) works without per-session SET. All three are
-    # required: preview (to install/use the extension), hypergraph optimizer
-    # (classic optimizer never selects the custom KNN scan → filesort → crash),
-    # and the custom-index debug gate (POC path is debug-gated). Extensions to
+    # (incl. the harness's) works without per-session SET. Required: preview (to
+    # install/use the extension) and the custom-index debug gate (POC path is
+    # debug-gated). The optimizer that routes the KNN scan is selectable via
+    # OPTIMIZER: "hypergraph" (default) turns hypergraph_optimizer ON; "classic"
+    # leaves it OFF so the classic optimizer path is exercised. Extensions to
     # install are passed space-separated via EXTENSIONS (default: vsql_vector,
     # the SVECTOR+HNSW extension). Datadir is fresh each run, so (re)install here.
-    echo "Applying gate defaults + installing extensions..." >&2
+    OPTIMIZER="${OPTIMIZER:-hypergraph}"
+    case "$OPTIMIZER" in
+      hypergraph) hg_switch="hypergraph_optimizer=on" ;;
+      classic)    hg_switch="hypergraph_optimizer=off" ;;
+      *) echo "ERROR: OPTIMIZER must be 'hypergraph' or 'classic', got '$OPTIMIZER'" >&2; exit 1 ;;
+    esac
+    echo "Applying gate defaults (optimizer=$OPTIMIZER) + installing extensions..." >&2
     "$MYSQL" --no-defaults -uroot --socket="$SOCKET" 2>>"$ERRLOG" <<SQL || true
 SET PERSIST vsql_allow_preview_extensions = ON;
-SET GLOBAL optimizer_switch='hypergraph_optimizer=on';
+SET GLOBAL optimizer_switch='$hg_switch';
 SET GLOBAL debug='+d,villagesql_custom_index_proceed';
 SQL
     # NOTE: install only ONE vector extension that registers the SVECTOR type.
