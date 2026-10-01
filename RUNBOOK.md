@@ -26,18 +26,23 @@ present, so they work whether or not you have activated it.
 Two artifacts: the **server**, and the **extension** built against it and staged
 into the server's `veb_output_directory/`.
 
+The harness runs `INSTALL EXTENSION vsql_vector`, which the server resolves to
+`vsql_vector.veb` in `veb_output_directory/`. The repo is `vsql-vector-pk`, but
+the extension it builds and installs is `vsql_vector` — don't rename the `.veb`
+when staging it; the server validates the basename against the manifest `"name"`.
+
 ```bash
 # server (RelWithDebInfo == -O2 is fine for the server)
-# CRITICAL: -DWITH_HYPERGRAPH_OPTIMIZER=ON. The custom KNN index ONLY routes under
-# the hypergraph optimizer, and that optimizer defaults ON *only in debug builds* —
-# in an optimized build it is compiled OUT unless you set this flag. Without it the
-# server builds fine but the vector index silently never routes (the runtime
+# The custom KNN index routes under the CLASSIC optimizer, which is the server
+# default — no special compile flag is needed for the default path. Add
+# -DWITH_HYPERGRAPH_OPTIMIZER=ON only if you want to exercise the hypergraph path
+# (OPTIMIZER=hypergraph): that optimizer defaults ON *only in debug builds* and is
+# compiled OUT of an optimized build unless you set the flag, and the runtime
 # `SET optimizer_switch='hypergraph_optimizer=on'` cannot enable what isn't
-# compiled in). This is a COMPILE flag, not a debug-vs-release thing — the build
-# stays optimized.
+# compiled in.
 cd <villagesql-server-src>
 mkdir -p build-rel && cd build-rel
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_HYPERGRAPH_OPTIMIZER=ON \
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DWITH_SSL=/opt/homebrew/opt/openssl@3
 make -j"$(getconf _NPROCESSORS_ONLN)"
 SRV=$(pwd)
@@ -46,7 +51,7 @@ SRV=$(pwd)
 # set NO build type, so it defaulted to -O0 and understated results ~6-10x.
 # ALWAYS pass -DCMAKE_BUILD_TYPE=Release (=> -O3 -DNDEBUG, auto-vectorizes the
 # distance kernel). Verify below.
-cd <vsql-vector-src>
+cd <vsql-vector-pk-src>
 mkdir -p build-rel && cd build-rel
 cmake .. -DVillageSQL_BUILD_DIR="$SRV" -DCMAKE_BUILD_TYPE=Release
 make -j"$(getconf _NPROCESSORS_ONLN)"
@@ -65,12 +70,10 @@ ls -al "$SRV/veb_output_directory/vsql_vector.veb"   # confirm it's the one you 
 
 **Runtime gates (required for the KNN index to install and route).** `start_server.sh`
 applies these automatically at boot; if you drive the server yourself, set them
-too, or the index won't install / the custom scan won't route (and the classic
-optimizer path crashes on it):
+too, or the index won't install:
 ```sql
-SET PERSIST vsql_allow_preview_extensions = ON;          -- needed to INSTALL + use the extension
-SET GLOBAL optimizer_switch = 'hypergraph_optimizer=on'; -- route the KNN scan (needs the compile flag above)
-SET GLOBAL debug = '+d,villagesql_custom_index_proceed'; -- custom-index gate; DEBUG builds only (no-op otherwise)
+SET PERSIST vsql_allow_preview_extensions = ON;           -- needed to INSTALL + use the extension
+SET GLOBAL optimizer_switch = 'hypergraph_optimizer=off'; -- classic (the default) routes the KNN scan
 ```
 
 ### MariaDB

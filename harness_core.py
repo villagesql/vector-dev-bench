@@ -26,16 +26,19 @@ DEFAULT_SOCKET = os.path.join(HERE, ".run", "mysqld.sock")
 
 def detect_srv_build():
     """Server build dir: $SRV_BUILD, else VillageSQL_BUILD_DIR from the
-    extension's build/CMakeCache.txt (same value used to build the .veb)."""
+    extension's CMakeCache.txt (same value used to build the .veb). The
+    optimized build-rel is preferred: timings off a debug build are not
+    perf-valid."""
     env = os.environ.get("SRV_BUILD")
     if env:
         return env
-    cache = os.path.join(REPO, "build", "CMakeCache.txt")
-    if os.path.isfile(cache):
-        with open(cache) as f:
-            for line in f:
-                if line.startswith("VillageSQL_BUILD_DIR:"):
-                    return line.split("=", 1)[1].strip()
+    for d in ("build-rel", "build"):
+        cache = os.path.join(REPO, d, "CMakeCache.txt")
+        if os.path.isfile(cache):
+            with open(cache) as f:
+                for line in f:
+                    if line.startswith("VillageSQL_BUILD_DIR:"):
+                        return line.split("=", 1)[1].strip()
     return None
 
 
@@ -66,6 +69,28 @@ PROFILES = {
         # for extension-namespaced dotted sysvars — separate server bug).
         "ef_param": {"style": "set", "var": "vsql_vector.ef_search"},
         # HNSW: metric is chosen by BOTH the index modifier (build) and the query fn
+        "index_ddl": ("CREATE INDEX idx_v ON t (v {idx_modifier}) USING EXTENDED(hnsw) "
+                      "WITH (M = {M}, ef_construction = {efc})"),
+        "metrics": {
+            "l2":     {"idx_modifier": "hnsw_l2",            "dist_fn": "L2_DISTANCE(v, {qlit})"},
+            "cosine": {"idx_modifier": "hnsw_cosine",        "dist_fn": "COSINE_DISTANCE(v, {qlit})"},
+            "l1":     {"idx_modifier": "hnsw_l1",            "dist_fn": "L1_DISTANCE(v, {qlit})"},
+            "ip":     {"idx_modifier": "hnsw_inner_product", "dist_fn": "INNER_PRODUCT(v, {qlit})", "order": "DESC"},
+        },
+    },
+    # A/B twin of vsql_vector that ingests each vector as RAW little-endian
+    # float32 BYTES via `_binary X'..'` instead of the '[...]' decimal literal.
+    # svector_from_string treats a value not starting with '[' as raw bytes
+    # (len == 4*dim). Same server/index/query; only the INSERT payload encoding
+    # differs. Compare build_s against `vsql_vector` to isolate the ingest
+    # (server decimal-parse vs byte-decode) cost. `vec_encode: hex` makes the
+    # harness emit the hex of the raw bytes for the {lit} slot.
+    "vsql_vector_bin": {
+        "extension": "vsql_vector",
+        "coltype": "SVECTOR({dim})",
+        "vec_encode": "hex",
+        "vec_literal": "_binary X'{lit}'",
+        "ef_param": {"style": "set", "var": "vsql_vector.ef_search"},
         "index_ddl": ("CREATE INDEX idx_v ON t (v {idx_modifier}) USING EXTENDED(hnsw) "
                       "WITH (M = {M}, ef_construction = {efc})"),
         "metrics": {
@@ -697,7 +722,15 @@ CREATE DATABASE recall_bench; USE recall_bench;
     if CLIENT != "psql":
         _mysql_conn(args.socket).select_db("recall_bench")
 
-    def lit(v): return prof["vec_literal"].format(lit=vec_lit(v), dim=args.dim)
+    # {lit} is either the decimal inner text ([...] path) or, for a profile that
+    # sets vec_encode=hex, the hex of the raw little-endian float32 bytes (the
+    # raw-bytes ingest path, wrapped by vec_literal as _binary X'..').
+    if prof.get("vec_encode") == "hex":
+        def _lit_slot(v):
+            return np.asarray(v, "<f4").tobytes().hex()
+    else:
+        _lit_slot = vec_lit
+    def lit(v): return prof["vec_literal"].format(lit=_lit_slot(v), dim=args.dim)
 
     # --- build: INSERT all rows (timed). ef_search is query-time, so a sweep
     # re-queries this same graph without rebuilding.
