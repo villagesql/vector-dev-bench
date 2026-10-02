@@ -6,12 +6,12 @@ for heavyweight published comparisons.
 
 > ⚠️ **vsql_vector requires in-development branches — it does NOT work on the
 > `main` branch of villagesql-server or vsql-vector.** The custom vector index
-> (`CREATE INDEX ... USING EXTENDED(hnsw)`) is not yet enabled on `main`: on main
-> the DDL is gated off (returns "Extended Index feature not yet implemented" in
-> non-debug builds) and the hypergraph optimizer that routes the KNN scan is not
-> compiled into release builds. You must build from the feature branches (see
-> Prerequisites) and with `-DWITH_HYPERGRAPH_OPTIMIZER=ON`. MariaDB and pgvector
-> work from their normal releases; this constraint is vsql-only.
+> (`CREATE INDEX ... USING EXTENDED(hnsw)`) is not yet enabled on `main`, so you
+> must build from the feature branches (see Prerequisites). The KNN scan routes
+> under the classic optimizer (the server default), so no special compile flag is
+> needed; `-DWITH_HYPERGRAPH_OPTIMIZER=ON` is only for exercising the hypergraph
+> path via `OPTIMIZER=hypergraph`. MariaDB and pgvector work from their normal
+> releases; this constraint is vsql-only.
 
 It drives three engines and judges ANN quality by **recall** — the fraction of
 the true k-nearest neighbours the index returns — because ANN indexes are
@@ -33,11 +33,11 @@ own thing. They share the same `--profile`/`--metric`/`--dim`/`--n`/`--M`/
 
 ## Supported engines (profiles)
 
-| profile        | engine                    | client | vector input | index |
-|----------------|---------------------------|--------|--------------|-------|
+| profile           | engine                    | client | vector input | index |
+|-------------------|---------------------------|--------|--------------|-------|
 | `vsql_vector`  | VillageSQL SVECTOR + HNSW | mysql  | text `'[...]'` | `CREATE INDEX ... USING EXTENDED(hnsw)` |
-| `mariadb`      | MariaDB MHNSW             | mariadb| `Vec_FromText` | inline `VECTOR INDEX` |
-| `pgvector`     | PostgreSQL + pgvector     | psql   | text `'[...]'` | `CREATE INDEX ... USING hnsw` |
+| `mariadb`         | MariaDB MHNSW             | mariadb| `Vec_FromText` | inline `VECTOR INDEX` |
+| `pgvector`        | PostgreSQL + pgvector     | psql   | text `'[...]'` | `CREATE INDEX ... USING hnsw` |
 
 > **Client note (fairness).** The `client` column names the SQL *dialect*, not the
 > transport. `vsql_vector` and `mariadb` both speak the MySQL protocol and are
@@ -85,9 +85,8 @@ that rigour for a fast iteration loop:
     against it (staged into the server's `veb_output_directory/`). **Both must be
     the in-development custom-index feature branches, NOT `main`** (see the
     warning above):
-    - the server built with `-DWITH_HYPERGRAPH_OPTIMIZER=ON`, from a branch that
-      carries the custom vector index and the read-under-write fix (a
-      `row_not_found` skip in the KNN scan).
+    - the server, from a branch that carries the custom vector index and the
+      read-under-write fix (a `row_not_found` skip in the KNN scan).
     - the `vsql_vector` extension, built `Release`/`-O3` against that server's
       SDK, from a branch that carries the full-ef-pool cursor for read-under-
       write backfill.

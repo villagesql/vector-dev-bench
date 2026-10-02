@@ -44,6 +44,65 @@ profile declares one of two styles, and the harness passes ef accordingly:
 A profile with neither (`varchar_ctrl`) rejects an ef sweep. Both styles are
 threaded through the single-query, parallel-reader, and `--emit-queries` paths.
 
+## Asked to RUN a benchmark? Follow this order
+
+Do not start probing the filesystem or inventing parameters. Work these steps in
+order; each one either has an answer already, or is a question for the user.
+Stop and ask rather than guess — a wrong guess here costs a long run.
+
+1. **What is being measured?** Recall sweep (`recall_bench.py`), build time
+   (`build_bench.py`), or read-under-write (`rw_bench.py`)?
+
+2. **Which engine(s)?** `vsql_vector`, `mariadb`, `pgvector`, `google`, or a
+   comparison of several (`run_sweep.sh` / `run_three_way.sh` orchestrate
+   one-at-a-time runs). If the user didn't say, ask — do not assume vsql.
+
+3. **Where do the binaries come from?** For each engine chosen, establish which
+   of these applies — **ask the user, don't go hunting**:
+   - already-built trees the user will point you at (the common case here), or
+   - installed packages / Homebrew kegs (MariaDB, Postgres), or
+   - a Docker image (`start_server_docker.sh`), or
+   - you are expected to build them (RUNBOOK §1 — this is slow; confirm first).
+
+   Then set the engine's env var: `SRV_BUILD` (vsql), `MB` (MariaDB), `PG`
+   (Postgres). **`SRV_BUILD` has no usable default** — `detect_srv_build()` only
+   finds a build when this repo sits *next to* the extension checkout, which is
+   not the normal layout. Note the server build dir is whatever the user built
+   (e.g. `build-relwithdebinfo`), not necessarily the RUNBOOK's `build-rel`.
+
+4. **Verify the binaries before running anything.** See "Preflight" below. A
+   long sweep that dies at minute 40 on a missing `.veb` is the failure mode this
+   step exists to prevent.
+
+5. **Smoke-test, then run.** Always do a tiny run first (§ Preflight step 5)
+   before the real sweep. Only then run the full job, under `caffeinate` if long.
+
+6. **Report honestly.** If the smoke test shows `recall@10` pinned at 1.0 and
+   flat across ef_search, the index is not being used — say so rather than
+   reporting the numbers as an index result.
+
+### Preflight (run these before any long job)
+
+For a vsql run, in order — each is a one-liner that fails fast:
+
+1. Server binary exists: `$SRV_BUILD/runtime_output_directory/mysqld`.
+2. The `.veb` is **staged and fresh**: the extension's build output must be
+   copied into `$SRV_BUILD/veb_output_directory/`, and its mtime must be *newer*
+   than the extension build. A stale staged `.veb` means you benchmark old code
+   (RUNBOOK §1). This copy is a manual step — nothing does it for you.
+3. Boot: `SRV_BUILD=... EXTENSIONS=<ext> bash start_server.sh`.
+4. **Confirm the extension actually installed** — `start_server.sh` is tolerant
+   of a failed `INSTALL` and still prints READY, so check explicitly:
+   `SELECT * FROM information_schema.extensions;` must be non-empty. If it is
+   empty, re-run the `INSTALL EXTENSION <ext>;` by hand to see the real error
+   (`VEB file not found: <ext>.veb` means step 2 was skipped or the name is
+   wrong — the SQL name, `.veb` basename, and manifest `"name"` must all match).
+5. Dataset present under `.datasets/`, and its parameters match your flags: the
+   filename encodes them — `fashion-mnist-784-euclidean` ⇒ `--dim 784
+   --metric l2`. Don't invent a dim/metric that disagrees with the file.
+6. Smoke run (small `--n`, seconds not minutes) — expect `recall@10` ≈ 0.95–1.0,
+   no ERROR, and recall that *falls* as ef_search drops.
+
 ## Setup & verification
 
 - **Setup:** `./setup.sh` — creates `.venv` and installs `requirements.txt`

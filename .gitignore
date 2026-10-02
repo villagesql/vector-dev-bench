@@ -12,3 +12,7 @@ __pycache__/
 # but any local stat dumps land here:
 *_stats.log
 .datasets/
+
+# Scratch working dirs and dated run output (results-YYYY-MM-DD/ etc.)
+scratch-*/
+results-*/
