@@ -467,6 +467,19 @@ def run_sql(client_bin, socket, sql, want_rows=False):
     return lines
 
 
+def apply_session_vars(args):
+    """Set every --session-var on the current connection. A session variable is
+    per-connection: SET GLOBAL does not reach a connection that is already open,
+    so a knob set from a side connection leaves this one on the default."""
+    svars = getattr(args, "session_var", None)
+    if not svars:
+        return
+    kw = "" if CLIENT == "psql" else "SESSION "
+    for sv in svars:
+        name, _, value = sv.partition("=")
+        run_sql(args.mysql, args.socket, f"SET {kw}{name.strip()} = {value.strip()};")
+
+
 def vec_lit(v):
     return "[" + ",".join(f"{x:.6g}" for x in v) + "]"
 
@@ -676,6 +689,12 @@ def build_index(args, prof, metric):
 
     # Gates (preview / hypergraph / custom-index debug) and extension install are
     # baked in as server defaults by start_server.sh, so no per-session SET needed.
+    # --session-var knobs are different: they are SESSION-scoped, so they must be
+    # set on THIS connection to reach the build (inserts maintain the HNSW graph
+    # and hit the same caches the queries do). The query batches re-set them
+    # because the parallel-reader path opens its own connections. Global
+    # variables are not set here -- SET GLOBAL reaches every connection.
+    apply_session_vars(args)
     # --- setup: schema. --no-index skips the custom index (SVECTOR column only)
     # to isolate generic column-store row insertion from HNSW graph maintenance.
     # (Recall is meaningless without the index — --no-index is a build-cost probe.)

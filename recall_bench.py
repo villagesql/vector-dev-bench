@@ -67,6 +67,15 @@ def main():
                     help="comma-separated ef_search values; builds the index ONCE "
                          "then re-queries at each (ef_search is query-time, so no "
                          "rebuild needed). Overrides --ef-search.")
+    ap.add_argument("--session-var", action="append", default=[],
+                    metavar="NAME=VALUE",
+                    help="extra SESSION variable to set on every query/build "
+                         "connection, repeatable. Needed for any knob the server "
+                         "scopes per session: SET GLOBAL does NOT reach a "
+                         "connection that is already open, and the parallel "
+                         "reader path opens one per worker, so a session-scoped "
+                         "knob must ride inside each batch. Global variables do "
+                         "NOT belong here -- set those with SET GLOBAL.")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--no-gate", action="store_true",
                     help="report recall but always exit 0 (do NOT fail when "
@@ -208,14 +217,28 @@ def main():
     ef_param = prof.get("ef_param", {})
     ef_inline = ef_param.get("style") == "inline"
 
+    # psql omits the SESSION keyword (session GUC); the mysql family uses
+    # SET SESSION.
+    set_kw = "" if core.CLIENT == "psql" else "SESSION "
+
     def ef_set_stmt(ef):
-        # The SET statement for a "set"-style ef param, or "" (empty) for an
-        # inline param / no ef. psql omits the SESSION keyword (session GUC);
-        # the mysql family uses SET SESSION.
-        if ef is None or ef_param.get("style") != "set":
-            return ""
-        kw = "" if core.CLIENT == "psql" else "SESSION "
-        return f"SET {kw}{ef_param['var']} = {ef};"
+        # Every SESSION-scoped setting the queries need, as SET statements to
+        # prefix the batch with -- the ef param plus whatever --session-var
+        # carries. Returns "" when there is nothing to set.
+        #
+        # These MUST ride inside the query batch rather than be set once up
+        # front: a session variable is per-connection, so SET GLOBAL from a
+        # side connection does not reach a connection that is already open, and
+        # the parallel-reader path opens a fresh connection per worker. A knob
+        # set on the wrong connection does not fail -- the run silently
+        # measures the default.
+        parts = []
+        if ef is not None and ef_param.get("style") == "set":
+            parts.append(f"SET {set_kw}{ef_param['var']} = {ef};")
+        for sv in getattr(args, "session_var", []):
+            name, _, value = sv.partition("=")
+            parts.append(f"SET {set_kw}{name.strip()} = {value.strip()};")
+        return "\n".join(parts)
 
     def _one_query_stmt(qi, ef=None):
         # The per-query SELECT. --dry-run replaces the real KNN search with a
