@@ -360,9 +360,13 @@ _WORKER_CONN = None
 
 def _reader_init(socket):
     """multiprocessing.Pool initializer: each worker process opens ONE connection
-    up front (before any timed work), stored per-process."""
+    up front (before any timed work), stored per-process. The schema is selected
+    AT CONNECT, like every other connection the harness opens -- the batched
+    query statements use unqualified table names and would otherwise fail with
+    "No database selected"."""
     global _WORKER_CONN
-    _WORKER_CONN = _new_mysql_conn(socket)
+    _db = None if CLIENT == "psql" else "recall_bench"
+    _WORKER_CONN = _new_mysql_conn(socket, database=_db)
 
 
 def _reader_warmup(_i):
