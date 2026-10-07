@@ -727,11 +727,24 @@ CREATE DATABASE recall_bench; USE recall_bench;
         _mysql_conn(args.socket).select_db("recall_bench")
 
     # {lit} is either the decimal inner text ([...] path) or, for a profile that
-    # sets vec_encode=hex, the hex of the raw little-endian float32 bytes (the
-    # raw-bytes ingest path, wrapped by vec_literal as _binary X'..').
+    # sets vec_encode=hex, the hex of the binary ingest form (wrapped by
+    # vec_literal as _binary X'..').
+    #
+    # The binary form is a 2-byte BIG-ENDIAN element count with the high bit
+    # set, then that many little-endian float32 elements:
+    #
+    #     [0x80 | dim_hi][dim_lo][f0 (4B LE)][f1]...[f(dim-1)]
+    #
+    # The tag bit is what tells the server this is binary rather than a decimal
+    # '[...]' literal, which is ASCII and so always starts below 0x80. Without
+    # the header the value is parsed as decimal and fails as a WARNING, not an
+    # error -- the rows land empty and the run looks like a recall collapse
+    # rather than an encoding bug.
     if prof.get("vec_encode") == "hex":
         def _lit_slot(v):
-            return np.asarray(v, "<f4").tobytes().hex()
+            a = np.asarray(v, "<f4")
+            header = (0x8000 | a.size).to_bytes(2, "big")
+            return (header + a.tobytes()).hex()
     else:
         _lit_slot = vec_lit
     def lit(v): return prof["vec_literal"].format(lit=_lit_slot(v), dim=args.dim)
