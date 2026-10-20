@@ -13,7 +13,7 @@ for heavyweight published comparisons.
 > path via `OPTIMIZER=hypergraph`. MariaDB and pgvector work from their normal
 > releases; this constraint is vsql-only.
 
-It drives three engines and judges ANN quality by **recall** — the fraction of
+It drives four engines and judges ANN quality by **recall** — the fraction of
 the true k-nearest neighbours the index returns — because ANN indexes are
 *approximate* and exact-match testing (MTR-style `.result` comparison) is
 meaningless for them.
@@ -38,10 +38,11 @@ own thing. They share the same `--profile`/`--metric`/`--dim`/`--n`/`--M`/
 | `vsql_vector`  | VillageSQL SVECTOR + HNSW | mysql  | text `'[...]'` | `CREATE INDEX ... USING EXTENDED(hnsw)` |
 | `mariadb`         | MariaDB MHNSW             | mariadb| `Vec_FromText` | inline `VECTOR INDEX` |
 | `pgvector`        | PostgreSQL + pgvector     | psql   | text `'[...]'` | `CREATE INDEX ... USING hnsw` |
+| `google`          | Google MySQL 9.7 VECTOR + ScaNN | mysql | `string_to_vector('[...]')` | `CREATE VECTOR INDEX ... DISTANCE_MEASURE=...` |
 
 > **Client note (fairness).** The `client` column names the SQL *dialect*, not the
-> transport. `vsql_vector` and `mariadb` both speak the MySQL protocol and are
-> driven by the **same PyMySQL code path** — identical connection setup, batching,
+> transport. `vsql_vector`, `mariadb`, and `google` all speak the MySQL protocol and
+> are driven by the **same PyMySQL code path** — identical connection setup, batching,
 > and result handling; only the emitted SQL differs. So any client-side overhead is
 > symmetric between them and cancels out in relative comparison. `pgvector` is the
 > one asymmetric client: it shells out to the `psql` CLI. (The `--mysql` flag is
@@ -96,6 +97,12 @@ that rigour for a fast iteration loop:
   - **mariadb**: a MariaDB 11.7+ build tree *or* an installed package (e.g.
     Homebrew `mariadb@11.8`). Both layouts are auto-detected.
   - **pgvector**: PostgreSQL 15+ with the `vector` extension available.
+  - **google**: a MySQL 9.7.1 build of Google's vector search proposal
+    ([mysql-server commit 51e4510](https://github.com/mysql/mysql-server/commit/51e4510c44b1e039321ff6e91ab56d62a0d50aac),
+    shared on [mysql-community#3](https://github.com/mysql/mysql-community/issues/3)),
+    plus the ScaNN runtime `libscann.so` built with its
+    `kmeans_interface/build_scann.sh`. Its authors describe it as an
+    experimental proof of concept.
 - Python venv with numpy (and h5py for real `--dataset` runs):
   ```
   python3 -m venv .venv && . .venv/bin/activate && pip install numpy h5py
@@ -133,6 +140,18 @@ python recall_bench.py --profile pgvector --metric l2 --dim 32 --n 20000 \
   --mysql /opt/homebrew/opt/postgresql@17/bin/psql --socket .run-pg
 ```
 
+Google MySQL + ScaNN boots with `start_gv.sh`. ScaNN is a trained index, so it
+is built after the data loads (`--index-mode post`, at least 1000 rows), and
+`--ef-search-sweep` sweeps `num_leaves_to_search`. ScaNN quantizes vectors, so
+recall plateaus below 1.0. RUNBOOK.md has the full steps.
+```bash
+GV_BUILD=/path/to/google-mysql/build SCANN_LIB=/path/to/dir/with/libscann.so \
+  bash start_gv.sh                           # boots on .run-gv/mysqld.sock
+python recall_bench.py --profile google --dataset fashion-mnist-784-euclidean \
+  --queries 1000 -k 10 --index-mode post --ef-search-sweep 10,50,100,200 \
+  --mysql $GV_BUILD/bin/mysql --socket .run-gv/mysqld.sock
+```
+
 ### parallel build (build_bench.py)
 Client-driven parallel index build — N connections insert into the same index
 concurrently. (Server-internal parallel-DDL `innodb_parallel_read_threads`
@@ -164,10 +183,11 @@ reader); `--rw-read-sql "SELECT MAX(id) FROM t"` is a plain-read control.
 ## Key flags
 
 Shared (all three CLIs):
-- `--profile`  vsql_vector | mariadb | pgvector | varchar_ctrl (a plain-VARCHAR
+- `--profile`  vsql_vector | mariadb | pgvector | google | varchar_ctrl (a plain-VARCHAR
   control — no vector engine, insert-only; use to prove a failure is server-side
   vs harness)
-- `--metric`   l2 | cosine | l1 | ip   (must be supported by the profile)
+- `--metric`   l2 | cosine | l1 | ip   (must be supported by the profile; `google`
+  takes l2, cosine, and ip)
 - `--dim --n -k`   dataset shape;  `--dataset NAME`  real ann-benchmarks dataset
   (precomputed ground truth; sets dim + metric)
 - `--M --ef-construction`    HNSW build params (MariaDB ignores ef_construction —
