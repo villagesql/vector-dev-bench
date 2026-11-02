@@ -38,12 +38,14 @@ kind; the rest use `mysql`.
 **Query shape beyond `ORDER BY <dist>`.** Most profiles express KNN as `ORDER BY
 dist_fn LIMIT k`. An engine whose approximate search needs another shape (e.g.
 `myvector` gates its HNSW index with a `WHERE` subquery and orders by a
-row-distance helper) declares a full `query_sql` template with `{qlit}/{k}/{ef}`
-placeholders, used in place of the `ORDER BY dist_fn` form across the recall and
+row-distance helper) declares a full `query_sql` template with
+`{qlit}/{k}/{ef}/{db}` placeholders (`{db}` = the mysql schema the tools build
+into, `harness_core.MYSQL_SCHEMA`, for fully-qualified names like `{db}.t.v`),
+used in place of the `ORDER BY dist_fn` form across the recall and
 read-under-write query paths. Such an engine may also declare `build_sql` (a
-post-load statement that builds the index, e.g. a stored-proc call) instead of
-`index_ddl`/inline `VECTOR INDEX`; it runs after the load, timed as the index
-step. The column/table DDL templates additionally receive `{col_bytes}`
+post-load statement that builds the index, e.g. a stored-proc call; it also gets
+the DDL template fields below) instead of `index_ddl`/inline `VECTOR INDEX`; it
+runs after the load, timed as the index step. The column/table DDL templates additionally receive `{col_bytes}`
 (dim*4+8), `{n}` (row count), `{efc}` (ef_construction) and `{dist}` (metric
 name) for engines that encode those in the column or its COMMENT.
 

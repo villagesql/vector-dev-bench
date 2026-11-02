@@ -23,6 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 DEFAULT_SOCKET = os.path.join(HERE, ".run", "mysqld.sock")
 
+# The schema the mysql-family tools build into (Postgres uses its pre-created
+# `bench` db instead). Centralized so a profile template that must name the
+# fully-qualified table (e.g. MyVector's `{db}.t.v`) stays in sync with it.
+MYSQL_SCHEMA = "recall_bench"
+
 
 def detect_srv_build():
     """Server build dir: $SRV_BUILD, else VillageSQL_BUILD_DIR from the
@@ -262,7 +267,7 @@ PROFILES = {
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
             "ENGINE=InnoDB;"),
         # Offline bulk build after the load, timed as the index step.
-        "build_sql": "CALL mysql.MYVECTOR_INDEX_BUILD('recall_bench.t.v', 'id')",
+        "build_sql": "CALL mysql.MYVECTOR_INDEX_BUILD('{db}.t.v', 'id')",
         # KNN. The documented surface is `WHERE MYVECTOR_IS_ANN(col, idcol, qvec,
         # opts)`, but that is sugar a server-side audit/parse hook rewrites into
         # the subquery below -- and that rewrite aborts when several statements
@@ -275,7 +280,7 @@ PROFILES = {
         # {qlit} is already myvector_construct('[...]').
         "query_sql": (
             "SELECT id FROM t WHERE ( id IN (select `myvecid` from "
-            "(select myvector_ann_set('recall_bench.t.v', 'id', {qlit}, "
+            "(select myvector_ann_set('{db}.t.v', 'id', {qlit}, "
             "'nn={k},ef_search={ef}') `_mvjson`) `_mvsrc`, "
             "JSON_TABLE(`_mvsrc`.`_mvjson`, '$[*]' "
             "COLUMNS(`myvecid` BIGINT PATH '$')) `myvector_ann`) ) "
@@ -467,7 +472,7 @@ def _reader_init(socket):
     query statements use unqualified table names and would otherwise fail with
     "No database selected"."""
     global _WORKER_CONN
-    _db = None if CLIENT == "psql" else "recall_bench"
+    _db = None if CLIENT == "psql" else MYSQL_SCHEMA
     _WORKER_CONN = _new_mysql_conn(socket, database=_db)
 
 
@@ -778,6 +783,7 @@ def build_index(args, prof, metric):
         "M": args.M,
         "efc": args.ef_construction,
         "dist": {"l2": "L2", "cosine": "Cosine", "ip": "InnerProduct"}.get(args.metric, "L2"),
+        "db": MYSQL_SCHEMA,   # schema the mysql tools build into; {db}.t.v for MyVector
     }
     coltype = prof["coltype"].format(**tmpl_kw)
     # index_ddl only exists for the separate-CREATE-INDEX profiles; profiles with
@@ -848,17 +854,17 @@ def build_index(args, prof, metric):
         setup = f"DROP TABLE IF EXISTS t;\n{schema}"
     else:
         setup = f"""
-DROP DATABASE IF EXISTS recall_bench;
-CREATE DATABASE recall_bench; USE recall_bench;
+DROP DATABASE IF EXISTS {MYSQL_SCHEMA};
+CREATE DATABASE {MYSQL_SCHEMA}; USE {MYSQL_SCHEMA};
 {schema}
 """
     run_sql(args.mysql, args.socket, setup)
     # Select the working schema on the persistent connection so all later
     # run_sql() statements run in-context (no USE prefix). The setup's own
-    # trailing `USE recall_bench` set it for the setup batch, but be explicit so
+    # trailing `USE {MYSQL_SCHEMA}` set it for the setup batch, but be explicit so
     # it survives even if run_sql reconnects.
     if CLIENT != "psql":
-        _mysql_conn(args.socket).select_db("recall_bench")
+        _mysql_conn(args.socket).select_db(MYSQL_SCHEMA)
 
     # {lit} is either the decimal inner text ([...] path) or, for a profile that
     # sets vec_encode=hex, the hex of the binary ingest form (wrapped by
@@ -926,7 +932,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # Each task = (socket, database, per-batch-INSERT-statements). The worker
         # opens its own connection with the schema selected (no USE prefix, no
         # shared pool connection).
-        _db = None if CLIENT == "psql" else "recall_bench"
+        _db = None if CLIENT == "psql" else MYSQL_SCHEMA
         tasks = [(args.socket, _db, _insert_batch_stmts(s)) for s in shards]
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=len(tasks))
