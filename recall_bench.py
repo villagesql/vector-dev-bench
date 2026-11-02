@@ -236,9 +236,17 @@ def main():
         # sees a non-@@Q digit row per query, which is fine.
         if args.dry_run:
             return "SELECT 1;"
-        fmt = {"qlit": lit(queries[qi])}
+        qlit = lit(queries[qi])
+        efv = ef if ef is not None else args.ef_search
+        # Engines whose ANN search is not a plain `ORDER BY <dist>` (e.g. MyVector
+        # gates the index via a WHERE function and orders by a row-distance helper)
+        # declare a full `query_sql` template with {qlit}/{k}/{ef} placeholders.
+        qtmpl = prof.get("query_sql")
+        if qtmpl:
+            return qtmpl.format(qlit=qlit, k=args.k, ef=efv) + ";"
+        fmt = {"qlit": qlit}
         if ef_inline:
-            fmt["ef"] = ef if ef is not None else args.ef_search
+            fmt["ef"] = efv
         dist = metric["dist_fn"].format(**fmt)
         order = metric.get("order", "")
         return f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};"
