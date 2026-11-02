@@ -28,9 +28,24 @@ language neutral between engines.
 **To add or change an engine:** edit the `PROFILES` dict in `harness_core.py`
 (each profile declares its `client`, `ef_param`, and per-`metric` SQL) and add a
 matching `start_<engine>.sh`. Registered profiles today: `vsql_vector`,
-`mariadb`, `pgvector`, `google` (Google MySQL + ScaNN), and `varchar_ctrl` (a
-plain-VARCHAR insert-only control). All but `pgvector` use the `mysql` client
-kind; `pgvector` uses `psql`.
+`mariadb`, `pgvector`, `google` (Google MySQL + ScaNN), `myvector` (a MySQL
+component with disk-persisted HNSW), and `varchar_ctrl` (a plain-VARCHAR
+insert-only control). All but `pgvector` use the `mysql` client kind; `pgvector`
+uses `psql`.
+
+**Query shape beyond `ORDER BY <dist>`.** Most profiles express KNN as `ORDER BY
+dist_fn LIMIT k`. An engine whose approximate search needs another shape (e.g.
+`myvector` gates its HNSW index with a `WHERE` subquery and orders by a
+row-distance helper) declares a full `query_sql` template with
+`{qlit}/{k}/{ef}/{db}` placeholders (`{db}` = the mysql schema the tools build
+into, `harness_core.MYSQL_SCHEMA`, for fully-qualified names like `{db}.t.v`),
+used in place of the `ORDER BY dist_fn` form across the recall and
+read-under-write query paths. Such an engine may also declare `build_sql` (a
+post-load statement that builds the index, e.g. a stored-proc call; it also gets
+the DDL template fields below) instead of `index_ddl`/inline `VECTOR INDEX`; it
+runs after the load, timed as the index step. The column/table DDL templates additionally receive `{col_bytes}`
+(dim*4+8), `{n}` (row count), `{efc}` (ef_construction) and `{dist}` (metric
+name) for engines that encode those in the column or its COMMENT.
 
 **`ef_param` — how the engine takes the query-time search-breadth knob.** Each
 profile declares one of two styles, and the harness passes ef accordingly:
@@ -53,7 +68,7 @@ Stop and ask rather than guess — a wrong guess here costs a long run.
 1. **What is being measured?** Recall sweep (`recall_bench.py`), build time
    (`build_bench.py`), or read-under-write (`rw_bench.py`)?
 
-2. **Which engine(s)?** `vsql_vector`, `mariadb`, `pgvector`, `google`, or a
+2. **Which engine(s)?** `vsql_vector`, `mariadb`, `pgvector`, `google`, `myvector`, or a
    comparison of several (`run_sweep.sh` / `run_three_way.sh` orchestrate
    one-at-a-time runs). If the user didn't say, ask — do not assume vsql.
 

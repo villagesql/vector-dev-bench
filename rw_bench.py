@@ -231,7 +231,7 @@ def main():
     if ef_param.get("style") == "set":
         core.run_sql(args.mysql, args.socket,
                      f"SET GLOBAL {ef_param['var']} = {ef};")
-    _db = "recall_bench"
+    _db = core.MYSQL_SCHEMA
     # Pre-build the read SQL pool; readers cycle through it. Built ONCE here,
     # outside the timed loop. --rw-read-sql overrides the KNN query with an
     # arbitrary read (e.g. "SELECT MAX(id) FROM t") -- a CONTROL: if a plain
@@ -240,6 +240,15 @@ def main():
     # path; if only the KNN read fails, it's the custom-index path.
     if args.rw_read_sql:
         query_sqls = [args.rw_read_sql]
+    elif prof.get("query_sql"):
+        # Engines with a full query template (e.g. MyVector's WHERE-gated,
+        # row-distance-ordered ANN read) that isn't a plain ORDER BY <dist>.
+        # ef_search rides inline (readers can't SET a per-query session var in
+        # this tight loop), so it's formatted into each query here.
+        qtmpl = prof["query_sql"]
+        query_sqls = [
+            qtmpl.format(qlit=lit(queries[qi]), k=args.k, ef=ef, db=core.MYSQL_SCHEMA)
+            for qi in range(args.queries)]
     else:
         order = metric.get("order", "")
         query_sqls = [
