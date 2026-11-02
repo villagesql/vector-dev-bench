@@ -247,7 +247,7 @@ def main():
         # this tight loop), so it's formatted into each query here.
         qtmpl = prof["query_sql"]
         query_sqls = [
-            qtmpl.format(qlit=lit(queries[qi]), k=args.k, ef=args.ef_search)
+            qtmpl.format(qlit=lit(queries[qi]), k=args.k, ef=ef)
             for qi in range(args.queries)]
     else:
         order = metric.get("order", "")
