@@ -35,6 +35,9 @@ def main():
                          "for shared build_index compatibility).")
     ap.add_argument("--M", type=int, default=16)
     ap.add_argument("--ef-construction", type=int, default=64)
+    ap.add_argument("--lists", type=int, default=None,
+                    help="IVF cell count for profiles that take one (turbovec_ivf); "
+                         "unset = round(sqrt(n))")
     ap.add_argument("--insert-batch", type=int, default=1000,
                     help="rows per INSERT statement (default 1000). 0 = single "
                          "statement of all n — only for the parse-cost probe; it "

@@ -1,10 +1,15 @@
 #!/bin/bash
 # Copyright (c) 2026 VillageSQL Contributors
 # SPDX-License-Identifier: Apache-2.0
-# start_postgres.sh -- boot a scratch PostgreSQL cluster with pgvector for the
-# recall harness, as a neutral third HNSW reference (pgvector). Mirrors
-# start_server.sh / start_mariadb.sh: fresh datadir each run, unix socket only,
-# prints the socket DIR on success (psql connects via -h <dir>).
+# start_postgres.sh: boot a scratch PostgreSQL cluster with a vector
+# extension for the recall harness: pgvector (the default) or pg_turbovec.
+# Mirrors start_server.sh / start_mariadb.sh: fresh datadir each run, unix
+# socket only, prints the socket DIR on success (psql connects via -h <dir>).
+#
+#   PG_EXTENSION  vector (default; pgvector) | pg_turbovec
+#     pg_turbovec is also added to shared_preload_libraries: its turbovec.*
+#     GUCs only exist when the library is preloaded, and without them a
+#     `SET turbovec.probes = ...` is accepted and silently does nothing.
 set -euo pipefail
 
 PGBIN="${PGBIN:-/opt/homebrew/opt/postgresql@17/bin}"
@@ -13,6 +18,12 @@ DATADIR="$WORKDIR/data"
 SOCKDIR="$WORKDIR"          # psql -h "$SOCKDIR"
 ERRLOG="$WORKDIR/pg.log"
 DB="bench"
+PG_EXTENSION="${PG_EXTENSION:-vector}"
+case "$PG_EXTENSION" in
+  vector)      PRELOAD="" ;;
+  pg_turbovec) PRELOAD="-c shared_preload_libraries=pg_turbovec" ;;
+  *) echo "ERROR: unknown PG_EXTENSION=$PG_EXTENSION (vector | pg_turbovec)" >&2; exit 1 ;;
+esac
 
 INITDB="$PGBIN/initdb"; PGCTL="$PGBIN/pg_ctl"; PSQL="$PGBIN/psql"; CREATEDB="$PGBIN/createdb"
 [ -x "$INITDB" ] || { echo "ERROR: initdb not found: $INITDB" >&2; exit 1; }
@@ -34,15 +45,28 @@ echo "Initializing scratch pg cluster..." >&2
 #     working set for a fair build comparison.
 SHARED_BUFFERS="${SHARED_BUFFERS:-128MB}"
 MAINT_WORK_MEM="${MAINT_WORK_MEM:-64MB}"
-echo "Starting postgres (socketdir=$SOCKDIR, shared_buffers=$SHARED_BUFFERS maint_work_mem=$MAINT_WORK_MEM)..." >&2
+echo "Starting postgres (socketdir=$SOCKDIR, extension=$PG_EXTENSION, shared_buffers=$SHARED_BUFFERS maint_work_mem=$MAINT_WORK_MEM)..." >&2
 "$PGCTL" -D "$DATADIR" -l "$ERRLOG" \
-  -o "-k $SOCKDIR -c listen_addresses='' -c shared_buffers=$SHARED_BUFFERS -c maintenance_work_mem=$MAINT_WORK_MEM" \
+  -o "-k $SOCKDIR -c listen_addresses='' -c shared_buffers=$SHARED_BUFFERS -c maintenance_work_mem=$MAINT_WORK_MEM $PRELOAD" \
   start >/dev/null 2>&1
 
 for i in $(seq 1 60); do
   if "$PSQL" -h "$SOCKDIR" -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
     "$CREATEDB" -h "$SOCKDIR" "$DB" 2>>"$ERRLOG" || true
-    "$PSQL" -h "$SOCKDIR" -d "$DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" >>"$ERRLOG" 2>&1
+    if ! "$PSQL" -h "$SOCKDIR" -d "$DB" -v ON_ERROR_STOP=1 \
+         -c "CREATE EXTENSION IF NOT EXISTS $PG_EXTENSION;" >>"$ERRLOG" 2>&1; then
+      echo "ERROR: CREATE EXTENSION $PG_EXTENSION failed; tail $ERRLOG:" >&2
+      tail -10 "$ERRLOG" >&2
+      exit 1
+    fi
+    if [ "$PG_EXTENSION" = pg_turbovec ]; then
+      NGUC="$("$PSQL" -h "$SOCKDIR" -d "$DB" -tAc \
+              "SELECT count(*) FROM pg_settings WHERE name LIKE 'turbovec.%'")"
+      if [ "${NGUC:-0}" -eq 0 ]; then
+        echo "ERROR: no turbovec.* GUCs registered; pg_turbovec is not preloaded" >&2
+        exit 1
+      fi
+    fi
     echo "READY sockdir=$SOCKDIR db=$DB" >&2
     echo "$SOCKDIR"
     exit 0
