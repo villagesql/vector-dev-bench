@@ -43,6 +43,9 @@ def main():
                          "to distance ties at the k-th boundary.")
     ap.add_argument("--M", type=int, default=16)
     ap.add_argument("--ef-construction", type=int, default=64)
+    ap.add_argument("--lists", type=int, default=None,
+                    help="IVF cell count for profiles that take one (turbovec_ivf); "
+                         "unset = round(sqrt(n))")
     ap.add_argument("--insert-batch", type=int, default=1000,
                     help="rows per INSERT statement (default 1000). 0 = single "
                          "statement of all n — only for the parse-cost probe; it "
@@ -208,14 +211,16 @@ def main():
     ef_param = prof.get("ef_param", {})
     ef_inline = ef_param.get("style") == "inline"
 
-    def ef_set_stmt(ef):
-        # The SET statement for a "set"-style ef param, or "" (empty) for an
-        # inline param / no ef. psql omits the SESSION keyword (session GUC);
-        # the mysql family uses SET SESSION.
-        if ef is None or ef_param.get("style") != "set":
-            return ""
-        kw = "" if core.CLIENT == "psql" else "SESSION "
-        return f"SET {kw}{ef_param['var']} = {ef};"
+    def session_stmt(ef):
+        # The statements a query connection runs before its queries: the
+        # profile's fixed session_sql, then the SET for a "set"-style ef param.
+        # "" (empty) when there is neither. psql omits the SESSION keyword
+        # (session GUC); the mysql family uses SET SESSION.
+        stmts = list(prof.get("session_sql", []))
+        if ef is not None and ef_param.get("style") == "set":
+            kw = "" if core.CLIENT == "psql" else "SESSION "
+            stmts.append(f"SET {kw}{ef_param['var']} = {ef};")
+        return "\n".join(stmts)
 
     def _one_query_stmt(qi, ef=None):
         # The per-query SELECT. --dry-run replaces the real KNN search with a
@@ -243,8 +248,8 @@ def main():
         # dominated by client startup. Sentinel SELECT delimits each query. A
         # "set"-style ef param must ride INSIDE this batch to apply to the query
         # connection (each run_sql is a fresh connection); an inline param is
-        # already in each query, so ef_set_stmt() returns "".
-        stmt = ef_set_stmt(ef)
+        # already in each query, so session_stmt() adds no SET for it.
+        stmt = session_stmt(ef)
         parts = [stmt] if stmt else []
         for qi in range(args.queries):
             parts.append(f"SELECT '@@Q{qi}' AS m;")
@@ -289,7 +294,7 @@ def main():
         shards = [s for s in shards if s]           # drop empties if readers>queries
         # "set"-style engines set ef per reader connection (prefix the SET);
         # inline-style engines carry ef inside each query (via _build_query_sql).
-        stmt = ef_set_stmt(ef)
+        stmt = session_stmt(ef)
         ef_prefix = (stmt + "\n") if stmt else ""
         sql_batches = [ef_prefix + _build_query_sql(s, ef) for s in shards]
 
@@ -333,7 +338,7 @@ def main():
         emit_ef = (args.ef_search if args.ef_search is not None
                    else (sweep[0] if sweep else None))
         with open(args.emit_queries, "w") as f:
-            stmt = ef_set_stmt(emit_ef)
+            stmt = session_stmt(emit_ef)
             if stmt:
                 f.write(stmt + "\n")
             for qi in range(args.queries):

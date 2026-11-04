@@ -10,18 +10,21 @@
 #   ENGINE=vsql   SRV_BUILD=/path/to/villagesql/build           bash run_sweep.sh
 #   ENGINE=mariadb MB=/opt/homebrew/opt/mariadb@11.8            bash run_sweep.sh
 #   ENGINE=pgvector PGBIN=/opt/homebrew/opt/postgresql@17/bin   bash run_sweep.sh
+#   ENGINE=turbovec PGBIN=/opt/homebrew/opt/postgresql@17/bin   bash run_sweep.sh
 #
 # Env knobs (all optional, sane defaults):
-#   ENGINE        vsql | mariadb | pgvector            (required)
+#   ENGINE        vsql | mariadb | pgvector | turbovec | turbovec_ivf  (required)
 #   MODE          build | scan | both                 (default both)
 #   N_LIST        space-separated row counts           (default "1000 5000 20000")
 #   DIM, M, EFC   vector dim / HNSW M / ef_construction (default 32 / 8 / 100)
-#   EF_SWEEP      comma ef_search values for scan       (default 100,200,400)
+#   EF_SWEEP      comma ef_search values for scan       (default 100,200,400;
+#                 turbovec: search_k 10,20,40,80,160; turbovec_ivf: probes 4,8,16,32)
+#   LISTS         turbovec_ivf IVF cell count            (default round(sqrt(N)))
 #   METRIC        l2 | cosine | l1 | ip                 (default l2)
 #   QUERIES, K    query count / k                       (default 50 / 10)
 #   BUF           InnoDB buffer pool (vsql/maria)       (default 4G)
 #   REPS          build-only reps per N                 (default 2)
-#   engine paths: SRV_BUILD (vsql), MB (mariadb), PGBIN (pgvector)
+#   engine paths: SRV_BUILD (vsql), MB (mariadb), PGBIN (pgvector, turbovec*)
 set -uo pipefail
 
 # Re-exec under caffeinate (macOS) so an idle/locked machine can't throttle a
@@ -31,11 +34,16 @@ if [ -z "${VB_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE="${ENGINE:?set ENGINE=vsql|mariadb|pgvector}"
+ENGINE="${ENGINE:?set ENGINE=vsql|mariadb|pgvector|turbovec|turbovec_ivf}"
 MODE="${MODE:-both}"
 N_LIST="${N_LIST:-1000 5000 20000}"
 DIM="${DIM:-32}"; M="${M:-8}"; EFC="${EFC:-100}"
-EF_SWEEP="${EF_SWEEP:-100,200,400}"; METRIC="${METRIC:-l2}"
+case "$ENGINE" in
+  turbovec)     EF_SWEEP="${EF_SWEEP:-10,20,40,80,160}" ;;
+  turbovec_ivf) EF_SWEEP="${EF_SWEEP:-4,8,16,32}" ;;
+  *)            EF_SWEEP="${EF_SWEEP:-100,200,400}" ;;
+esac
+METRIC="${METRIC:-l2}"
 QUERIES="${QUERIES:-50}"; K="${K:-10}"; BUF="${BUF:-4G}"; REPS="${REPS:-2}"
 # Prefer the repo's own venv (created by ./setup.sh) over system python, so a
 # user who ran setup.sh doesn't silently fall back to a python without numpy.
@@ -57,6 +65,7 @@ if ! "$PY" -c "import harness_core" 2>/dev/null; then
 fi
 
 # --- resolve engine: start script, client binary, socket, profile ---------
+EXTRA_ARGS=()   # engine-specific recall_bench.py flags
 case "$ENGINE" in
   vsql)
     : "${SRV_BUILD:?set SRV_BUILD=/path/to/villagesql/build}"
@@ -78,9 +87,16 @@ case "$ENGINE" in
               bash "$HERE/start_mariadb.sh" >/dev/null 2>&1; }
     stop()  { [ -f "$HERE/.run-maria/mariadb.pid" ] && kill "$(cat "$HERE/.run-maria/mariadb.pid")" 2>/dev/null; }
     ;;
-  pgvector)
+  pgvector|turbovec|turbovec_ivf)
     PGBIN="${PGBIN:-/opt/homebrew/opt/postgresql@17/bin}"
-    PROFILE=pgvector
+    PROFILE="$ENGINE"
+    case "$ENGINE" in
+      pgvector) PG_EXTENSION=vector ;;
+      *)        PG_EXTENSION=pg_turbovec ;;
+    esac
+    # turbovec_ivf trains its cells at CREATE INDEX, so it must bulk-build.
+    [ "$ENGINE" = turbovec_ivf ] && EXTRA_ARGS+=(--index-mode post)
+    [ -n "${LISTS:-}" ] && EXTRA_ARGS+=(--lists "$LISTS")
     CLIENT="$PGBIN/psql"
     SOCKET="$HERE/.run-pg"
     # Postgres uses MB/GB units, not the MySQL-style "4G" that BUF carries.
@@ -88,7 +104,8 @@ case "$ENGINE" in
     # gets a valid shared_buffers.
     PG_BUF="$BUF"; case "$PG_BUF" in *[GMK]) PG_BUF="${PG_BUF}B";; esac
     start() { SHARED_BUFFERS="$PG_BUF" MAINT_WORK_MEM="${MAINT_WORK_MEM:-2GB}" \
-              PGBIN="$PGBIN" bash "$HERE/start_postgres.sh" >/dev/null 2>&1; }
+              PG_EXTENSION="$PG_EXTENSION" PGBIN="$PGBIN" \
+              bash "$HERE/start_postgres.sh" >/dev/null 2>&1; }
     stop()  { [ -d "$HERE/.run-pg/data" ] && "$PGBIN/pg_ctl" -D "$HERE/.run-pg/data" stop -m immediate >/dev/null 2>&1; }
     ;;
   *) echo "unknown ENGINE=$ENGINE" >&2; exit 2;;
@@ -96,7 +113,7 @@ esac
 
 hb() { "$PY" "$HERE/recall_bench.py" --profile "$PROFILE" --metric "$METRIC" \
         --dim "$DIM" --M "$M" --ef-construction "$EFC" --insert-batch 1000 \
-        --mysql "$CLIENT" --socket "$SOCKET" "$@"; }
+        --mysql "$CLIENT" --socket "$SOCKET" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$@"; }
 
 # Run recall_bench.py, tee its full output to a temp file so we can (a) filter
 # the summary lines for the console AND (b) still detect a crash. Returns the

@@ -163,6 +163,58 @@ PROFILES = {
             "ip":     {"idx_modifier": "vector_ip_ops",     "dist_fn": "v <#> {qlit}"},
         },
     },
+    # pg_turbovec (PostgreSQL): TurboQuant-quantized codes (bit_width 4 here,
+    # its default) scanned for a candidate set, which is then reranked against
+    # the full-precision vectors kept in the table. Not a graph index, so
+    # --M/--ef-construction don't apply. Started by start_postgres.sh with
+    # PG_EXTENSION=pg_turbovec, which preloads the library: without
+    # shared_preload_libraries the turbovec.* GUCs don't exist and every SET
+    # below is silently a no-op. Its type, operators and opclasses live in the
+    # `turbovec` schema (it coexists with pgvector's `vector`), so every name
+    # is schema-qualified rather than relying on search_path. session_sql pins
+    # a query's scan to one thread so per-query QPS is comparable with the
+    # single-threaded engines; that is the default since 2.14.0, but 2.13.x
+    # used up to min(cores, 4). The index needs dim to be a multiple of 8.
+    #
+    # Two profiles, one per index kind:
+    #   turbovec      flat (lists = 0): scans every code; ef = turbovec.search_k,
+    #                 the candidate budget handed to the rerank.
+    #   turbovec_ivf  IVF (lists = --lists, default round(sqrt(n))): scans only
+    #                 turbovec.probes cells; ef = probes. Its cells are trained
+    #                 at CREATE INDEX time, so it needs --index-mode post.
+    "turbovec": {
+        "client": "psql",
+        "extension": None,
+        "coltype": "turbovec.vector CHECK (turbovec.vector_dims(v) = {dim})",
+        "vec_literal": "'{lit}'::turbovec.vector",
+        "ef_param": {"style": "set", "var": "turbovec.search_k"},
+        "session_sql": ["SET turbovec.scan_parallelism = 1;"],
+        "index_ddl": ("CREATE INDEX ON t USING turbovec (v {idx_modifier}) "
+                      "WITH (bit_width = 4, lists = 0)"),
+        "metrics": {
+            "l2":     {"idx_modifier": "turbovec.vec_l2_ops",     "dist_fn": "v OPERATOR(turbovec.<->) {qlit}"},
+            "cosine": {"idx_modifier": "turbovec.vec_cosine_ops", "dist_fn": "v OPERATOR(turbovec.<=>) {qlit}"},
+            "l1":     {"idx_modifier": "turbovec.vec_l1_ops",     "dist_fn": "v OPERATOR(turbovec.<+>) {qlit}"},
+            "ip":     {"idx_modifier": "turbovec.vec_ip_ops",     "dist_fn": "v OPERATOR(turbovec.<#>) {qlit}"},
+        },
+    },
+    "turbovec_ivf": {
+        "client": "psql",
+        "extension": None,
+        "coltype": "turbovec.vector CHECK (turbovec.vector_dims(v) = {dim})",
+        "vec_literal": "'{lit}'::turbovec.vector",
+        "ef_param": {"style": "set", "var": "turbovec.probes"},
+        "session_sql": ["SET turbovec.scan_parallelism = 1;"],
+        "index_mode": "post",
+        "index_ddl": ("CREATE INDEX ON t USING turbovec (v {idx_modifier}) "
+                      "WITH (bit_width = 4, lists = {lists})"),
+        "metrics": {
+            "l2":     {"idx_modifier": "turbovec.vec_l2_ops",     "dist_fn": "v OPERATOR(turbovec.<->) {qlit}"},
+            "cosine": {"idx_modifier": "turbovec.vec_cosine_ops", "dist_fn": "v OPERATOR(turbovec.<=>) {qlit}"},
+            "l1":     {"idx_modifier": "turbovec.vec_l1_ops",     "dist_fn": "v OPERATOR(turbovec.<+>) {qlit}"},
+            "ip":     {"idx_modifier": "turbovec.vec_ip_ops",     "dist_fn": "v OPERATOR(turbovec.<#>) {qlit}"},
+        },
+    },
     # Google MySQL 9.7 native VECTOR + ScaNN approximate index (WL#16081 /
     # CloudSQL). VECTOR(N) type; literals via string_to_vector('[...]'); index
     # is `CREATE VECTOR INDEX ... DISTANCE_MEASURE=<m>`; KNN is
@@ -666,12 +718,18 @@ def build_index(args, prof, metric):
     coltype = prof["coltype"].format(dim=args.dim, varchar_len=varchar_len)
     # index_ddl only exists for the separate-CREATE-INDEX profiles; profiles with
     # a full table_ddl (e.g. mariadb) don't have it.
+    # {lists} is the IVF cell count (turbovec_ivf); --lists unset means
+    # round(sqrt(n)), the starting point pg_turbovec recommends.
+    lists = getattr(args, "lists", None) or max(1, round(args.n ** 0.5))
     index_ddl = (prof["index_ddl"].format(
-        M=args.M, efc=args.ef_construction, idx_modifier=metric["idx_modifier"])
+        M=args.M, efc=args.ef_construction, idx_modifier=metric["idx_modifier"],
+        lists=lists)
         if "index_ddl" in prof else "")
+    lists_note = f" lists={lists}" if "{lists}" in prof.get("index_ddl", "") else ""
 
     print(f"profile={args.profile} metric={args.metric} dim={args.dim} n={args.n} queries={args.queries} "
-          f"k={args.k} M={args.M} ef_construction={args.ef_construction} ef_search={args.ef_search}")
+          f"k={args.k} M={args.M} ef_construction={args.ef_construction} ef_search={args.ef_search}"
+          f"{lists_note}")
 
     # Pull the actual config from the live server (see report_config). Working-set
     # floor = N * dim * 4 bytes (the raw float32 vectors); the HNSW graph adds
@@ -697,6 +755,10 @@ def build_index(args, prof, metric):
                   f"CREATE TABLE (incremental only).", file=sys.stderr)
             raise SystemExit(2)
         post_index = index_ddl                       # run AFTER inserts, timed
+    elif prof.get("index_mode") == "post" and not args.no_index:
+        print(f"ERROR: profile '{args.profile}' trains its index at CREATE INDEX "
+              f"time, so it needs --index-mode post.", file=sys.stderr)
+        raise SystemExit(2)
 
     if "table_ddl" in prof:
         key = "no_index_table_ddl" if args.no_index else "table_ddl"

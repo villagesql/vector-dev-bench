@@ -27,22 +27,28 @@ language neutral between engines.
 
 **To add or change an engine:** edit the `PROFILES` dict in `harness_core.py`
 (each profile declares its `client`, `ef_param`, and per-`metric` SQL) and add a
-matching `start_<engine>.sh`. Registered profiles today: `vsql_vector`,
-`mariadb`, `pgvector`, `google` (Google MySQL + ScaNN), and `varchar_ctrl` (a
-plain-VARCHAR insert-only control). All but `pgvector` use the `mysql` client
-kind; `pgvector` uses `psql`.
+matching `start_<engine>.sh` (or, for another Postgres extension, a
+`PG_EXTENSION` case in `start_postgres.sh`). Registered profiles today:
+`vsql_vector`, `mariadb`, `pgvector`, `turbovec` / `turbovec_ivf` (pg_turbovec
+flat and IVF), `google` (Google MySQL + ScaNN), and `varchar_ctrl` (a
+plain-VARCHAR insert-only control). The Postgres profiles (`pgvector`,
+`turbovec*`) use the `psql` client kind; the rest use `mysql`.
 
 **`ef_param` — how the engine takes the query-time search-breadth knob.** Each
 profile declares one of two styles, and the harness passes ef accordingly:
 - `{"style": "set", "var": NAME}` — a **separate statement** (`SET SESSION NAME =
   v`, or `SET NAME = v` for psql) emitted before the queries; the query then
   reads it implicitly. Used by the session-var engines (`vsql_vector`,
-  `mariadb`, `pgvector`).
+  `mariadb`, `pgvector`, `turbovec*`).
 - `{"style": "inline"}` — ef rides **inside the query** itself; the metric's
   `dist_fn` carries an `{ef}` placeholder the harness formats per query (e.g.
   ScaNN's `APPROX_DISTANCE(..., 'num_leaves_to_search={ef}')`). Used by `google`.
 A profile with neither (`varchar_ctrl`) rejects an ef sweep. Both styles are
 threaded through the single-query, parallel-reader, and `--emit-queries` paths.
+A profile's optional `session_sql` (a list of statements) runs on those same
+query connections ahead of the ef `SET` (e.g. `turbovec` pins
+`scan_parallelism`). A profile with `"index_mode": "post"` refuses
+`--index-mode incremental` (an index trained at `CREATE INDEX`).
 
 ## Asked to RUN a benchmark? Follow this order
 

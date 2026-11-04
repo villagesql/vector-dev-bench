@@ -39,13 +39,16 @@ own thing. They share the same `--profile`/`--metric`/`--dim`/`--n`/`--M`/
 | `mariadb`         | MariaDB MHNSW             | mariadb| `Vec_FromText` | inline `VECTOR INDEX` |
 | `pgvector`        | PostgreSQL + pgvector     | psql   | text `'[...]'` | `CREATE INDEX ... USING hnsw` |
 | `google`          | Google MySQL 9.7 VECTOR + ScaNN | mysql | `string_to_vector('[...]')` | `CREATE VECTOR INDEX ... DISTANCE_MEASURE=...` |
+| `turbovec`        | PostgreSQL + pg_turbovec, flat | psql | `'[...]'::turbovec.vector` | `CREATE INDEX ... USING turbovec ... WITH (lists = 0)` |
+| `turbovec_ivf`    | PostgreSQL + pg_turbovec, IVF  | psql | `'[...]'::turbovec.vector` | `CREATE INDEX ... USING turbovec ... WITH (lists = N)` |
 
 > **Client note (fairness).** The `client` column names the SQL *dialect*, not the
 > transport. `vsql_vector`, `mariadb`, and `google` all speak the MySQL protocol and
 > are driven by the **same PyMySQL code path** — identical connection setup, batching,
 > and result handling; only the emitted SQL differs. So any client-side overhead is
-> symmetric between them and cancels out in relative comparison. `pgvector` is the
-> one asymmetric client: it shells out to the `psql` CLI. (The `--mysql` flag is
+> symmetric between them and cancels out in relative comparison. The Postgres
+> profiles (`pgvector`, `turbovec*`) are the asymmetric client: they shell out to
+> the `psql` CLI. (The `--mysql` flag is
 > therefore vestigial for the query path — PyMySQL drives it regardless of which
 > `mysql`/`mariadb` binary you point at; the flag still feeds the `start_*.sh`
 > scripts and config reporting.)
@@ -97,6 +100,9 @@ that rigour for a fast iteration loop:
   - **mariadb**: a MariaDB 11.7+ build tree *or* an installed package (e.g.
     Homebrew `mariadb@11.8`). Both layouts are auto-detected.
   - **pgvector**: PostgreSQL 15+ with the `vector` extension available.
+  - **turbovec**: PostgreSQL 13-18 with [pg_turbovec](https://github.com/gburd/pg_turbovec)
+    installed into it (a Rust/pgrx build: `cargo pgrx install --release
+    --pg-config $PGBIN/pg_config`). The index needs dim to be a multiple of 8.
   - **google**: a MySQL 9.7.1 build of Google's vector search proposal
     ([mysql-server commit 51e4510](https://github.com/mysql/mysql-server/commit/51e4510c44b1e039321ff6e91ab56d62a0d50aac),
     shared on [mysql-community#3](https://github.com/mysql/mysql-community/issues/3)),
@@ -152,6 +158,27 @@ python recall_bench.py --profile google --dataset fashion-mnist-784-euclidean \
   --mysql $GV_BUILD/bin/mysql --socket .run-gv/mysqld.sock
 ```
 
+pg_turbovec boots with the same `start_postgres.sh`, with `PG_EXTENSION=pg_turbovec`,
+which also preloads the library (without that its `turbovec.*` settings don't
+exist and every `SET` is silently ignored; the script fails if they are missing).
+It is not a graph index: it scans 4-bit TurboQuant codes for candidates and
+reranks them against the full-precision vectors, so `--M`/`--ef-construction`
+don't apply. `--ef-search-sweep` sweeps `turbovec.search_k` (the candidate
+budget) for `turbovec`, and `turbovec.probes` (IVF cells scanned) for
+`turbovec_ivf`. Both pin `turbovec.scan_parallelism = 1`, one thread per query
+like the other engines. `turbovec_ivf` trains its cells at `CREATE INDEX`, so it
+needs `--index-mode post`; `--lists N` sets the cell count (default
+`round(sqrt(n))`).
+```bash
+PG_EXTENSION=pg_turbovec SHARED_BUFFERS=4GB MAINT_WORK_MEM=2GB bash start_postgres.sh
+python recall_bench.py --profile turbovec --dataset fashion-mnist-784-euclidean \
+  --queries 1000 -k 10 --index-mode post --ef-search-sweep 10,20,40,80,160 \
+  --mysql /opt/homebrew/opt/postgresql@17/bin/psql --socket .run-pg
+python recall_bench.py --profile turbovec_ivf --dataset fashion-mnist-784-euclidean \
+  --queries 1000 -k 10 --index-mode post --ef-search-sweep 4,8,16,32 \
+  --mysql /opt/homebrew/opt/postgresql@17/bin/psql --socket .run-pg
+```
+
 ### parallel build (build_bench.py)
 Client-driven parallel index build — N connections insert into the same index
 concurrently. (Server-internal parallel-DDL `innodb_parallel_read_threads`
@@ -183,7 +210,8 @@ reader); `--rw-read-sql "SELECT MAX(id) FROM t"` is a plain-read control.
 ## Key flags
 
 Shared (all three CLIs):
-- `--profile`  vsql_vector | mariadb | pgvector | google | varchar_ctrl (a plain-VARCHAR
+- `--profile`  vsql_vector | mariadb | pgvector | turbovec | turbovec_ivf | google |
+  varchar_ctrl (a plain-VARCHAR
   control — no vector engine, insert-only; use to prove a failure is server-side
   vs harness)
 - `--metric`   l2 | cosine | l1 | ip   (must be supported by the profile; `google`
@@ -192,6 +220,8 @@ Shared (all three CLIs):
   (precomputed ground truth; sets dim + metric)
 - `--M --ef-construction`    HNSW build params (MariaDB ignores ef_construction —
   hardcoded to 10 upstream)
+- `--lists N`    IVF cell count for `turbovec_ivf` (default `round(sqrt(n))`;
+  recall_bench and build_bench)
 - `--no-index`   build the column with no index (build-floor / insert-cost probe)
 - `--insert-batch N`   rows per INSERT statement (default 1000)
 - `--mysql --socket` / `--host --port`   client + connection
@@ -227,3 +257,6 @@ rw_bench.py:
 - **Guard against silent full-scan.** Recall pinned at exactly 1.0 that does not
   fall with lower ef_search usually means the index is not being used (the
   optimizer chose a brute-force scan). `EXPLAIN` to confirm the index is in plan.
+  The flat `turbovec` profile is the exception to reading flat recall as a
+  fallback: it scans every code by design, and its recall levels off once
+  `search_k` is a little above k. `EXPLAIN` is still how to confirm it.
