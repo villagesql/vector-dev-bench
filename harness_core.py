@@ -266,8 +266,14 @@ PROFILES = {
         "no_index_table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
             "ENGINE=InnoDB;"),
-        # Offline bulk build after the load, timed as the index step.
-        "build_sql": "CALL mysql.MYVECTOR_INDEX_BUILD('{db}.t.v', 'id')",
+        # Offline bulk build after the load, timed as the index step. DROP first:
+        # MyVector keeps built indexes in memory keyed by '{db}.t.v', and that
+        # survives the harness's DROP DATABASE -- so a second run on the same
+        # server (other metric, M, ef_construction, data) would otherwise silently
+        # reuse the FIRST run's graph (e.g. a cosine table searched through an L2
+        # index: recall stuck ~0.65 at any ef). DROP is a no-op if none exists.
+        "build_sql": ("CALL mysql.MYVECTOR_INDEX_DROP('{db}.t.v'); "
+                      "CALL mysql.MYVECTOR_INDEX_BUILD('{db}.t.v', 'id')"),
         # KNN. The documented surface is `WHERE MYVECTOR_IS_ANN(col, idcol, qvec,
         # opts)`, but that is sugar a server-side audit/parse hook rewrites into
         # the subquery below -- and that rewrite aborts when several statements
