@@ -582,6 +582,23 @@ def vec_lit(v):
     return "[" + ",".join(f"{x:.6g}" for x in v) + "]"
 
 
+def make_lit(vec_literal, vec_encode, dim):
+    """Return lit(v) -> the profile's SQL literal for vector v. Module-level and
+    built from plain strings so a spawned worker (e.g. rw_bench's writers) can
+    rebuild the exact encoding the initial load used -- see build_index()."""
+    if vec_encode == "hex":
+        def _lit_slot(v):
+            a = np.asarray(v, "<f4")
+            header = (0x8000 | a.size).to_bytes(2, "big")
+            return (header + a.tobytes()).hex()
+    else:
+        _lit_slot = vec_lit
+
+    def lit(v):
+        return vec_literal.format(lit=_lit_slot(v), dim=dim)
+    return lit
+
+
 # Config the harness pulls FROM THE LIVE SERVER (not from the launch flags — a
 # flag can be silently clamped, ignored, or overridden by a config file; only the
 # running server tells the truth). Reported as a header so every result file
@@ -880,14 +897,7 @@ CREATE DATABASE {MYSQL_SCHEMA}; USE {MYSQL_SCHEMA};
     # the header the value is parsed as decimal and fails as a WARNING, not an
     # error -- the rows land empty and the run looks like a recall collapse
     # rather than an encoding bug.
-    if prof.get("vec_encode") == "hex":
-        def _lit_slot(v):
-            a = np.asarray(v, "<f4")
-            header = (0x8000 | a.size).to_bytes(2, "big")
-            return (header + a.tobytes()).hex()
-    else:
-        _lit_slot = vec_lit
-    def lit(v): return prof["vec_literal"].format(lit=_lit_slot(v), dim=args.dim)
+    lit = make_lit(prof["vec_literal"], prof.get("vec_encode"), args.dim)
 
     # --- build: INSERT all rows (timed). ef_search is query-time, so a sweep
     # re-queries this same graph without rebuilding.

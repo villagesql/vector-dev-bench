@@ -84,11 +84,15 @@ def _rw_write_worker(arg):
     Uses the same shared WALL-CLOCK start t_start as the readers, so writes begin
     at t_start + start_offset and the read-QPS graph aligns.
     arg = (socket, database, dim, batch, delay, t_start, start_offset,
-           write_duration, id_base, seed)."""
+           write_duration, id_base, seed, vec_literal, vec_encode).
+    vec_literal/vec_encode are the profile's, so concurrent rows use the same
+    SQL encoding as the initial load (e.g. myvector_construct('[...]'), or the
+    _binary X'..' form) rather than a bare '[...]' string."""
     import time as _t
     import numpy as _np
     (socket, database, dim, batch, delay, t_start, start_offset, write_duration,
-     id_base, seed) = arg
+     id_base, seed, vec_literal, vec_encode) = arg
+    lit = core.make_lit(vec_literal, vec_encode, dim)
     conn = _new_mysql_conn(socket, database=database)
     rng = _np.random.default_rng(seed)
     nid = id_base
@@ -102,11 +106,13 @@ def _rw_write_worker(arg):
             _t.sleep(0.01)
         deadline = t_start + start_offset + write_duration
         while _t.time() < deadline:
-            vecs = rng.standard_normal((batch, dim)).astype(_np.float32)
+            # Integer-valued (truncated) components, as before -- short SQL, and
+            # for '{lit}'-style profiles the text is byte-identical to the old
+            # hand-built '[...]'. int32 first so -0.x truncates to 0, not "-0".
+            vecs = (rng.standard_normal((batch, dim))
+                    .astype(_np.int32).astype(_np.float32))
             rows = ",\n".join(
-                "({}, '[{}]')".format(nid + j,
-                                      ",".join(str(int(x)) for x in vecs[j]))
-                for j in range(batch))
+                "({}, {})".format(nid + j, lit(vecs[j])) for j in range(batch))
             if w_start is None:
                 w_start = _t.time()
             try:
@@ -266,7 +272,8 @@ def main():
     id_block = 10_000_000  # disjoint id range per writer (no PK collision)
     write_tasks = [(args.socket, _db, args.dim, args.rw_write_batch,
                     args.rw_write_delay, t_start, args.rw_write_start,
-                    args.rw_write_duration, args.n + w * id_block, 1000 + w)
+                    args.rw_write_duration, args.n + w * id_block, 1000 + w,
+                    prof["vec_literal"], prof.get("vec_encode"))
                    for w in range(nW)]
 
     ctx = mp.get_context("spawn")
