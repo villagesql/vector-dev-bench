@@ -246,7 +246,7 @@ def main():
     # path; if only the KNN read fails, it's the custom-index path.
     if args.rw_read_sql:
         query_sqls = [args.rw_read_sql]
-    elif prof.get("query_sql"):
+    elif prof.get("query_sql") and not args.no_index:
         # Engines with a full query template (e.g. MyVector's WHERE-gated,
         # row-distance-ordered ANN read) that isn't a plain ORDER BY <dist>.
         # ef_search rides inline (readers can't SET a per-query session var in
