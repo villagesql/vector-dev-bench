@@ -42,12 +42,22 @@ row-distance helper) declares a full `query_sql` template with
 `{qlit}/{k}/{ef}/{db}` placeholders (`{db}` = the mysql schema the tools build
 into, `harness_core.MYSQL_SCHEMA`, for fully-qualified names like `{db}.t.v`),
 used in place of the `ORDER BY dist_fn` form across the recall and
-read-under-write query paths. Such an engine may also declare `build_sql` (a
-post-load statement that builds the index, e.g. a stored-proc call; it also gets
-the DDL template fields below) instead of `index_ddl`/inline `VECTOR INDEX`; it
-runs after the load, timed as the index step. The column/table DDL templates additionally receive `{col_bytes}`
-(dim*4+8), `{n}` (row count), `{efc}` (ef_construction) and `{dist}` (metric
+read-under-write query paths (`--no-index` falls back to `dist_fn`). Such an
+engine may also declare `build_sql` (a post-load statement that builds the
+index, e.g. a stored-proc call; it also gets the DDL template fields below)
+instead of `index_ddl`/inline `VECTOR INDEX`; it runs after the load, timed as
+the index step, and requires `--index-mode post`. The column/table DDL templates
+additionally receive `{col_bytes}` (dim*4+8), `{n}` (row count), `{cap}` (row
+count plus any write headroom), `{efc}` (ef_construction) and `{dist}` (metric
 name) for engines that encode those in the column or its COMMENT.
+
+**Engine-specific lifecycle hooks (`myvector`).** `fixed_capacity: True` marks an
+index whose size is fixed at build time: `rw_bench` then reserves
+`--rw-max-rows` (default 100,000) as headroom in `{cap}` and caps its writers to
+it, because an insert past MyVector's capacity aborts mysqld. `index_drop_sql`
+(guarded by `index_drop_if`) runs before setup to drop an index that outlived
+the previous run's `DROP DATABASE`; with `online=Y` such an index would
+otherwise capture this run's load.
 
 **`ef_param` — how the engine takes the query-time search-breadth knob.** Each
 profile declares one of two styles, and the harness passes ef accordingly:
@@ -74,9 +84,9 @@ Stop and ask rather than guess — a wrong guess here costs a long run.
 1. **What is being measured?** Recall sweep (`recall_bench.py`), build time
    (`build_bench.py`), or read-under-write (`rw_bench.py`)?
 
-2. **Which engine(s)?** `vsql_vector`, `mariadb`, `pgvector`, `google`, `myvector`, or a
-   comparison of several (`run_sweep.sh` / `run_three_way.sh` orchestrate
-   one-at-a-time runs). If the user didn't say, ask — do not assume vsql.
+2. **Which engine(s)?** `vsql_vector`, `mariadb`, `pgvector`, `google`,
+   `myvector`, or a comparison of several (`run_sweep.sh` / `run_three_way.sh`
+   orchestrate one-at-a-time runs). If the user didn't say, ask — do not assume vsql.
 
 3. **Where do the binaries come from?** For each engine chosen, establish which
    of these applies — **ask the user, don't go hunting**:

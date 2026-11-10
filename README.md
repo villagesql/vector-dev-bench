@@ -41,9 +41,10 @@ own thing. They share the same `--profile`/`--metric`/`--dim`/`--n`/`--M`/
 | `google`          | Google MySQL 9.7 VECTOR + ScaNN | mysql | `string_to_vector('[...]')` | `CREATE VECTOR INDEX ... DISTANCE_MEASURE=...` |
 | `turbovec`        | PostgreSQL + pg_turbovec, flat | psql | `'[...]'::turbovec.vector` | `CREATE INDEX ... USING turbovec ... WITH (lists = 0)` |
 | `turbovec_ivf`    | PostgreSQL + pg_turbovec, IVF  | psql | `'[...]'::turbovec.vector` | `CREATE INDEX ... USING turbovec ... WITH (lists = N)` |
+| `myvector`        | MySQL 8.4+ + MyVector component, HNSW | mysql | `myvector_construct('[...]')` | `MYVECTOR` column COMMENT + `CALL MYVECTOR_INDEX_BUILD` after the load |
 
 > **Client note (fairness).** The `client` column names the SQL *dialect*, not the
-> transport. `vsql_vector`, `mariadb`, and `google` all speak the MySQL protocol and
+> transport. `vsql_vector`, `mariadb`, `google`, and `myvector` all speak the MySQL protocol and
 > are driven by the **same PyMySQL code path** — identical connection setup, batching,
 > and result handling; only the emitted SQL differs. So any client-side overhead is
 > symmetric between them and cancels out in relative comparison. The Postgres
@@ -109,6 +110,10 @@ that rigour for a fast iteration loop:
     plus the ScaNN runtime `libscann.so` built with its
     `kmeans_interface/build_scann.sh`. Its authors describe it as an
     experimental proof of concept.
+  - **myvector**: Docker, plus a [MyVector](https://github.com/askdba/myvector)
+    component build (`libmyvector_component.so` + `myvector.json`) and its
+    install SQL (`sql/myvector_install_component.sql`). It runs in a stock
+    `mysql:<tag>` image (8.4 by default); no server build is needed.
 - Python venv with numpy (and h5py for real `--dataset` runs):
   ```
   python3 -m venv .venv && . .venv/bin/activate && pip install numpy h5py
@@ -179,6 +184,28 @@ python recall_bench.py --profile turbovec_ivf --dataset fashion-mnist-784-euclid
   --mysql /opt/homebrew/opt/postgresql@17/bin/psql --socket .run-pg
 ```
 
+MyVector boots with `start_myvector.sh`: a stock `mysql:<tag>` container with the
+component installed, its UDFs and procedures registered, and the `myvector.cnf` it
+needs to connect back to the server. It prints the `tcp:` spec to pass as
+`--socket`. The vector lives in a `VARBINARY` column whose `MYVECTOR` COMMENT
+declares the HNSW index. The graph is built by a stored procedure after the load,
+so the profile needs `--index-mode post`. KNN uses MyVector's `myvector_ann_set`
+form (the `MYVECTOR_IS_ANN` syntax is rewritten by a parse hook that rejects
+multi-statement batches) and takes `ef_search` inline, so pass `--ef-search` or
+`--ef-search-sweep`. Metrics: l2 and cosine. The index is created with
+`online=Y`, so MyVector follows the binlog and indexes `rw_bench.py`'s concurrent
+writes like the other engines do. Its capacity is fixed at build time, so
+`rw_bench.py` reserves room for those writes and caps them (`--rw-max-rows`,
+default 100,000).
+```bash
+MYVECTOR_SO=/path/to/libmyvector_component.so \
+MYVECTOR_PROCS=/path/to/myvector/sql/myvector_install_component.sql \
+  bash start_myvector.sh                     # prints tcp:127.0.0.1:3308
+python recall_bench.py --profile myvector --dataset fashion-mnist-784-euclidean \
+  --queries 1000 -k 10 --index-mode post --ef-search-sweep 10,20,50,100,200 \
+  --socket tcp:127.0.0.1:3308
+```
+
 ### parallel build (build_bench.py)
 Client-driven parallel index build — N connections insert into the same index
 concurrently. (Server-internal parallel-DDL `innodb_parallel_read_threads`
@@ -211,11 +238,11 @@ reader); `--rw-read-sql "SELECT MAX(id) FROM t"` is a plain-read control.
 
 Shared (all three CLIs):
 - `--profile`  vsql_vector | mariadb | pgvector | turbovec | turbovec_ivf | google |
-  varchar_ctrl (a plain-VARCHAR
+  myvector | varchar_ctrl (a plain-VARCHAR
   control — no vector engine, insert-only; use to prove a failure is server-side
   vs harness)
 - `--metric`   l2 | cosine | l1 | ip   (must be supported by the profile; `google`
-  takes l2, cosine, and ip)
+  takes l2, cosine, and ip; `myvector` takes l2 and cosine)
 - `--dim --n -k`   dataset shape;  `--dataset NAME`  real ann-benchmarks dataset
   (precomputed ground truth; sets dim + metric)
 - `--M --ef-construction`    HNSW build params (MariaDB ignores ef_construction —
@@ -237,7 +264,9 @@ build_bench.py:
 rw_bench.py:
 - `--readers N` / `--rw-duration S` / `--rw-write-threads M` / `--rw-write-start S`
   / `--rw-write-duration S` / `--rw-write-delay S` (0 = busy-write; dials write
-  pressure) / `--rw-write-batch N` / `--rw-csv FILE` / `--rw-read-uncommitted`
+  pressure) / `--rw-write-batch N` / `--rw-max-rows N` (cap on total rows written;
+  unbounded except for fixed-capacity indexes like `myvector`, which default to
+  100,000 and reserve that headroom) / `--rw-csv FILE` / `--rw-read-uncommitted`
   (diagnostic) / `--rw-read-sql SQL` (control)
 
 ## Methodology notes (learned the hard way)
