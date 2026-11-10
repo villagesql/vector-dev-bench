@@ -259,9 +259,11 @@ PROFILES = {
         "vec_literal": "myvector_construct('{lit}')",
         "ef_param": {"style": "inline"},  # ef_search rides inside query_sql
         # size = row count (HNSW capacity); dist = L2 or Cosine; ef = ef_construction.
+        # Option keys are case-sensitive in MyVector: `M=`, not `m=` (a lowercase
+        # key is silently ignored and the graph falls back to M=16).
         "table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL "
-            "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={n},m={M},"
+            "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={n},M={M},"
             "ef={efc},idcol=id,dist={dist}') ENGINE=InnoDB;"),
         "no_index_table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
