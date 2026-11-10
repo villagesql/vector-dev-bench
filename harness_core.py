@@ -258,16 +258,35 @@ PROFILES = {
         "coltype": "VARBINARY({col_bytes})",
         "vec_literal": "myvector_construct('{lit}')",
         "ef_param": {"style": "inline"},  # ef_search rides inside query_sql
-        # size = row count (HNSW capacity); dist = L2 or Cosine; ef = ef_construction.
         # Option keys are case-sensitive in MyVector: `M=`, not `m=` (a lowercase
         # key is silently ignored and the graph falls back to M=16).
+        # size = HNSW capacity ({cap} = rows + any rw_bench write headroom; MyVector
+        # never grows the graph, and an insert past capacity aborts mysqld);
+        # dist = L2 or Cosine; ef = ef_construction. online=Y: MyVector follows the
+        # binlog and applies later INSERTs to the graph, so rw_bench's concurrent
+        # writes are indexed like on the other engines (needs myvector.cnf, which
+        # start_myvector.sh writes).
         "table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL "
-            "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={n},M={M},"
-            "ef={efc},idcol=id,dist={dist}') ENGINE=InnoDB;"),
+            "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={cap},M={M},"
+            "ef={efc},online=Y,idcol=id,dist={dist}') ENGINE=InnoDB;"),
         "no_index_table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
             "ENGINE=InnoDB;"),
+        # Built after the load (build_sql), never incrementally: needs --index-mode post.
+        "index_mode": "post",
+        # The HNSW graph has a fixed capacity (size=), so rw_bench must reserve
+        # headroom for its writers and cap them to it (--rw-max-rows).
+        "fixed_capacity": True,
+        # A built index lives on in MyVector's memory after DROP DATABASE and, with
+        # online=Y, keeps applying binlog INSERTs for '{db}.t.v' -- so the NEXT
+        # run's load would flow into the old graph and can overflow its capacity
+        # (which aborts mysqld). Drop it before setup whenever the previous t.v was
+        # a MyVector column (index_drop_if returns a count; DROP needs the column).
+        "index_drop_if": ("SELECT COUNT(*) FROM information_schema.columns "
+                          "WHERE table_schema = '{db}' AND table_name = 't' "
+                          "AND column_name = 'v' AND column_comment LIKE 'MYVECTOR%'"),
+        "index_drop_sql": "CALL mysql.MYVECTOR_INDEX_DROP('{db}.t.v')",
         # Offline bulk build after the load, timed as the index step. DROP first:
         # MyVector keeps built indexes in memory keyed by '{db}.t.v', and that
         # survives the harness's DROP DATABASE -- so a second run on the same
@@ -805,9 +824,12 @@ def build_index(args, prof, metric):
         "varchar_len": varchar_len,
         "col_bytes": args.dim * 4 + 8,      # MyVector VARBINARY: 4B/float + 8B header
         "n": args.n,
+        # Index capacity for fixed-size graphs (MyVector's size=): the initial
+        # rows plus any headroom rw_bench reserves for its concurrent writers.
+        "cap": args.n + (getattr(args, "index_headroom", 0) or 0),
         "M": args.M,
         "efc": args.ef_construction,
-        "dist": {"l2": "L2", "cosine": "Cosine", "ip": "InnerProduct"}.get(args.metric, "L2"),
+        "dist": {"l2": "L2", "cosine": "Cosine"}.get(args.metric, ""),
         "db": MYSQL_SCHEMA,   # schema the mysql tools build into; {db}.t.v for MyVector
     }
     coltype = prof["coltype"].format(**tmpl_kw)
@@ -848,8 +870,14 @@ def build_index(args, prof, metric):
         # MyVector's `CALL MYVECTOR_INDEX_BUILD(...)`) rather than CREATE INDEX or
         # an inline VECTOR INDEX. The column DDL declares the index parameters (in
         # MyVector's case via the MYVECTOR COMMENT); the actual graph is built here
-        # after the load, timed as the index step. This is independent of
-        # --index-mode (there is no incremental form), so it applies regardless.
+        # after the load, timed as the index step. There is no incremental form,
+        # so (like turbovec_ivf) require --index-mode post rather than silently
+        # overriding the default `incremental`.
+        if args.index_mode != "post":
+            print(f"ERROR: profile '{args.profile}' builds its index after the "
+                  f"load (build_sql), so it needs --index-mode post.",
+                  file=sys.stderr)
+            raise SystemExit(2)
         post_index = prof["build_sql"].format(**tmpl_kw)
     elif args.index_mode == "post" and not args.no_index:
         if "index_ddl" not in prof:
@@ -883,6 +911,14 @@ DROP DATABASE IF EXISTS {MYSQL_SCHEMA};
 CREATE DATABASE {MYSQL_SCHEMA}; USE {MYSQL_SCHEMA};
 {schema}
 """
+    # Engines whose index outlives DROP DATABASE (MyVector) declare a guarded
+    # drop to run BEFORE setup, so the old index can't capture this run's load.
+    if prof.get("index_drop_sql") and CLIENT != "psql":
+        guard = prof["index_drop_if"].format(**tmpl_kw)
+        if any(l.strip() not in ("", "0") for l in
+               run_sql(args.mysql, args.socket, guard + ";", want_rows=True)):
+            run_sql(args.mysql, args.socket,
+                    prof["index_drop_sql"].format(**tmpl_kw) + ";")
     run_sql(args.mysql, args.socket, setup)
     # Select the working schema on the persistent connection so all later
     # run_sql() statements run in-context (no USE prefix). The setup's own

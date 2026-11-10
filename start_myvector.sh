@@ -23,7 +23,9 @@
 #                   procedures (mysql.MYVECTOR_INDEX_BUILD, _STATUS, _DROP, _LOAD)
 #                   -- from the MyVector repo (e.g. its component install SQL).
 #   MYSQL_TAG       stock MySQL image tag (default 8.4).
-#   PORT            host port to publish (default 3306). The harness --port / tcp:.
+#   PORT            host port to publish on 127.0.0.1 (default 3308, to avoid a
+#                   local mysqld on 3306 and start_gv.sh's 3307). The harness
+#                   --port / tcp:.
 #   NAME            container name (default vdb-myvector).
 #   READY_TIMEOUT   seconds to wait for readiness (default 120).
 #
@@ -35,7 +37,7 @@ MYVECTOR_SO="${MYVECTOR_SO:?set MYVECTOR_SO to the built libmyvector_component.s
 MYVECTOR_JSON="${MYVECTOR_JSON:-$(dirname "$MYVECTOR_SO")/myvector.json}"
 MYVECTOR_PROCS="${MYVECTOR_PROCS:?set MYVECTOR_PROCS to the MyVector stored-procedure install SQL}"
 MYSQL_TAG="${MYSQL_TAG:-8.4}"
-PORT="${PORT:-3306}"
+PORT="${PORT:-3308}"
 NAME="${NAME:-vdb-myvector}"
 READY_TIMEOUT="${READY_TIMEOUT:-120}"
 HOST="127.0.0.1"
@@ -69,6 +71,9 @@ PLUGIN_DIR="${PLUGIN_DIR%/}"
 # INSTALL the component) -- the same recipe as MyVector's own demo container.
 # Root credentials are fine here: this is a throwaway bench container.
 CNF_HOOK=$(mktemp "${TMPDIR:-/tmp}/myvector-cnf-hook.XXXXXX")
+# The hook only runs on first boot (initdb), so it's removed when this script
+# exits. The container is throwaway (re-run this script for a fresh one);
+# `docker restart` on it would fail on the now-missing bind-mount source.
 trap 'rm -f "$CNF_HOOK"' EXIT
 cat >"$CNF_HOOK" <<'HOOK'
 cat >/var/lib/mysql/myvector.cnf <<CNF
@@ -82,7 +87,7 @@ HOOK
 chmod 644 "$CNF_HOOK"
 
 echo "Starting mysql:$MYSQL_TAG as '$NAME' with the MyVector component..." >&2
-$DOCKER run -d --name "$NAME" -p "${PORT}:3306" \
+$DOCKER run -d --name "$NAME" -p "$HOST:${PORT}:3306" \
   -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
   -v "$MYVECTOR_SO":"$PLUGIN_DIR"/myvector.so:ro \
   -v "$MYVECTOR_JSON":"$PLUGIN_DIR"/myvector.json:ro \
@@ -143,6 +148,12 @@ for proc in MYVECTOR_INDEX_DROP MYVECTOR_INDEX_BUILD; do
     missing="$missing mysql.$proc"
   fi
 done
+# The profile declares online=Y (MyVector follows the binlog to index rw_bench's
+# concurrent writes), which needs row-based binary logging -- the stock image's
+# default, but check rather than assume.
+if [ "$(count "SELECT CONCAT(@@log_bin, @@binlog_format);")" != "1ROW" ]; then
+  missing="$missing log_bin=ON+binlog_format=ROW"
+fi
 if [ -n "$missing" ]; then
   echo "ERROR: MyVector objects missing:$missing -- check the component build" \
        "and MYVECTOR_PROCS." >&2
