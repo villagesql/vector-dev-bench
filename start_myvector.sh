@@ -51,13 +51,42 @@ docker info >/dev/null 2>&1 || DOCKER="sudo docker"
 # Fresh container each run (datadir goes with it -> component re-installs cleanly).
 $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
 
+# The component loader resolves 'file://myvector' to <plugin_dir>/myvector.so +
+# myvector.json, so mount them there. Ask the image for its plugin_dir rather
+# than hardcoding it: the official Oracle-Linux-based images use
+# /usr/lib64/mysql/plugin, Debian-based ones /usr/lib/mysql/plugin.
+PLUGIN_DIR=$($DOCKER run --rm --entrypoint mysqld "mysql:$MYSQL_TAG" --verbose --help 2>/dev/null \
+  | awk '$1 == "plugin-dir" {print $2}')
+PLUGIN_DIR="${PLUGIN_DIR%/}"
+[ -n "$PLUGIN_DIR" ] || { echo "ERROR: could not read plugin-dir from mysql:$MYSQL_TAG" >&2; exit 1; }
+
+# myvector.cnf: MYVECTOR_INDEX_BUILD (and online index updates) open their own
+# connection back to the server, configured from myvector.cnf in mysqld's working
+# directory (the datadir). Without it the build fails ("Can't connect to local
+# MySQL server through socket ''"), the index stays empty and every ANN query
+# returns nothing (recall 0). A raw mysql:<tag> image has no such file, so write
+# it from an initdb hook that sorts BEFORE zz-myvector-procs.sql (which may
+# INSTALL the component) -- the same recipe as MyVector's own demo container.
+# Root credentials are fine here: this is a throwaway bench container.
+CNF_HOOK=$(mktemp "${TMPDIR:-/tmp}/myvector-cnf-hook.XXXXXX")
+trap 'rm -f "$CNF_HOOK"' EXIT
+cat >"$CNF_HOOK" <<'HOOK'
+cat >/var/lib/mysql/myvector.cnf <<CNF
+myvector_host=127.0.0.1
+myvector_port=3306
+myvector_user_id=root
+myvector_user_password=${MYSQL_ROOT_PASSWORD}
+CNF
+chmod 600 /var/lib/mysql/myvector.cnf
+HOOK
+chmod 644 "$CNF_HOOK"
+
 echo "Starting mysql:$MYSQL_TAG as '$NAME' with the MyVector component..." >&2
-# Plugin dir is /usr/lib/mysql/plugin in the official image; the component loader
-# resolves 'file://myvector' to <plugindir>/myvector.so + myvector.json.
 $DOCKER run -d --name "$NAME" -p "${PORT}:3306" \
   -e MYSQL_ROOT_PASSWORD="$ROOT_PW" \
-  -v "$MYVECTOR_SO":/usr/lib/mysql/plugin/myvector.so:ro \
-  -v "$MYVECTOR_JSON":/usr/lib/mysql/plugin/myvector.json:ro \
+  -v "$MYVECTOR_SO":"$PLUGIN_DIR"/myvector.so:ro \
+  -v "$MYVECTOR_JSON":"$PLUGIN_DIR"/myvector.json:ro \
+  -v "$CNF_HOOK":/docker-entrypoint-initdb.d/00-myvector-cnf.sh:ro \
   -v "$MYVECTOR_PROCS":/docker-entrypoint-initdb.d/zz-myvector-procs.sql:ro \
   "mysql:$MYSQL_TAG" >/dev/null
 
@@ -72,22 +101,49 @@ done
 [ -n "$ready" ] || { echo "ERROR: mysqld did not become ready" >&2; $DOCKER logs --tail 40 "$NAME" >&2; exit 1; }
 
 echo "Installing MyVector component + UDFs..." >&2
-# myvector_distance auto-registers (dynamic UDF); the rest need CREATE FUNCTION.
-# The stored procedures come from MYVECTOR_PROCS (run by the init dir on first
-# boot). myvector.cnf lets the index build connect back to the server.
+# The component registers its own UDFs (myvector_construct, myvector_distance,
+# myvector_ann_set, ...); myvector_row_distance & co. are supplemental and need
+# CREATE FUNCTION ... SONAME. The stored procedures come from MYVECTOR_PROCS
+# (run by the init dir on first boot) -- which may itself INSTALL the component
+# and CREATE those functions, so each step below is skipped if already present.
+# That keeps the install idempotent WITHOUT swallowing errors: any failure here
+# aborts the script (set -e) instead of printing READY on a broken server.
+count() { mysql_root -N -e "$1"; }
+udf_count() {
+  count "SELECT COUNT(*) FROM performance_schema.user_defined_functions WHERE udf_name = '$1';"
+}
+
+if [ "$(count "SELECT COUNT(*) FROM mysql.component WHERE component_urn = 'file://myvector';")" = "0" ]; then
+  mysql_root -e "INSTALL COMPONENT 'file://myvector';"
+fi
+for spec in "myvector_row_distance REAL" "myvector_is_valid INTEGER" \
+            "myvector_search_open_udf STRING"; do
+  fn="${spec% *}"; ret="${spec#* }"
+  if [ "$(udf_count "$fn")" = "0" ]; then
+    mysql_root -e "CREATE FUNCTION $fn RETURNS $ret SONAME 'myvector.so';"
+  fi
+done
 mysql_root -e "
-  INSTALL COMPONENT 'file://myvector';
-  CREATE FUNCTION myvector_row_distance    RETURNS REAL    SONAME 'myvector.so';
-  CREATE FUNCTION myvector_is_valid        RETURNS INTEGER SONAME 'myvector.so';
-  CREATE FUNCTION myvector_search_open_udf RETURNS STRING  SONAME 'myvector.so';
   CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED BY 'bench';
   GRANT ALL PRIVILEGES ON *.* TO 'bench'@'%' WITH GRANT OPTION;
   FLUSH PRIVILEGES;
-" 2>&1 | grep -vi "already exists" || true
+"
 
-# Sanity: the query-side UDF the harness profile depends on must exist.
-if ! mysql_root -N -e "SELECT COUNT(*) FROM mysql.func WHERE name='myvector_ann_set';" 2>/dev/null | grep -q '^[1-9]'; then
-  echo "WARNING: myvector_ann_set not registered -- check the component build / init SQL." >&2
+# Sanity: every object the harness profile depends on must exist. Check
+# performance_schema, not mysql.func: the component's own UDFs are registered
+# dynamically and never appear in mysql.func.
+missing=""
+for fn in myvector_construct myvector_distance myvector_ann_set myvector_row_distance; do
+  if [ "$(udf_count "$fn")" = "0" ]; then missing="$missing $fn()"; fi
+done
+if [ "$(count "SELECT COUNT(*) FROM information_schema.routines
+               WHERE routine_schema = 'mysql' AND routine_name = 'MYVECTOR_INDEX_BUILD';")" = "0" ]; then
+  missing="$missing mysql.MYVECTOR_INDEX_BUILD"
+fi
+if [ -n "$missing" ]; then
+  echo "ERROR: MyVector objects missing:$missing -- check the component build" \
+       "and MYVECTOR_PROCS." >&2
+  exit 1
 fi
 
 echo "READY host=$HOST port=$PORT" >&2
