@@ -136,10 +136,13 @@ missing=""
 for fn in myvector_construct myvector_distance myvector_ann_set myvector_row_distance; do
   if [ "$(udf_count "$fn")" = "0" ]; then missing="$missing $fn()"; fi
 done
-if [ "$(count "SELECT COUNT(*) FROM information_schema.routines
-               WHERE routine_schema = 'mysql' AND routine_name = 'MYVECTOR_INDEX_BUILD';")" = "0" ]; then
-  missing="$missing mysql.MYVECTOR_INDEX_BUILD"
-fi
+# The profile's build_sql calls DROP then BUILD, so both procedures are required.
+for proc in MYVECTOR_INDEX_DROP MYVECTOR_INDEX_BUILD; do
+  if [ "$(count "SELECT COUNT(*) FROM information_schema.routines
+                 WHERE routine_schema = 'mysql' AND routine_name = '$proc';")" = "0" ]; then
+    missing="$missing mysql.$proc"
+  fi
+done
 if [ -n "$missing" ]; then
   echo "ERROR: MyVector objects missing:$missing -- check the component build" \
        "and MYVECTOR_PROCS." >&2
