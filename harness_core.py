@@ -277,6 +277,9 @@ PROFILES = {
         # The HNSW graph has a fixed capacity (size=), so rw_bench must reserve
         # headroom for its writers and cap them to it (--rw-max-rows).
         "fixed_capacity": True,
+        # rw_bench's mixed write load (delete/update_vec) is not enabled for
+        # MyVector; it is untested with DELETE/UPDATE of indexed rows.
+        "supports_dml": False,
         # A built index lives on in MyVector's memory after DROP DATABASE and, with
         # online=Y, keeps applying binlog INSERTs for '{db}.t.v' -- so the NEXT
         # run's load would flow into the old graph and can overflow its capacity

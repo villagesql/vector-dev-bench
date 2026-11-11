@@ -238,6 +238,21 @@ made concurrent KNN-read + INSERT work at REPEATABLE READ (full-ef-pool cursor +
 skip-on-not-found). `--rw-read-uncommitted` is a diagnostic (READ UNCOMMITTED
 reader); `--rw-read-sql "SELECT MAX(id) FROM t"` is a plain-read control.
 
+The writers can also delete and update. `--rw-write-mix` sets the weights of
+the operations; writer w owns the ids with id % writers == w and deletes or
+updates only those, so writers never conflict with each other:
+```bash
+python rw_bench.py --profile vsql_vector --metric l2 --dim 32 --n 20000 \
+  --readers 4 --rw-duration 30 --rw-write-threads 4 --rw-write-start 5 \
+  --rw-write-duration 20 --rw-write-mix insert=40,delete=30,update_vec=30 \
+  --rw-txn-ops 4 --mysql .../mysql --socket .run/mysqld.sock
+```
+It then also reports each operation's rate, failed transactions by error code,
+and the table's row count before and after.
+
+Every run also counts short results: KNN queries with LIMIT k that returned
+fewer than k rows, per phase, with how many rows they returned.
+
 ## Key flags
 
 Shared (all three CLIs):
@@ -272,6 +287,11 @@ rw_bench.py:
   unbounded except for fixed-capacity indexes like `myvector`, which default to
   100,000 and reserve that headroom) / `--rw-csv FILE` / `--rw-read-uncommitted`
   (diagnostic) / `--rw-read-sql SQL` (control)
+- `--rw-write-mix insert=W,delete=W,update_vec=W` (default `insert=100`, the
+  insert-only load) / `--rw-txn-ops N` (operations per transaction in a mixed
+  load) / `--rw-update-mode move|random` (update_vec moves the vector by small
+  noise, or replaces it) / `--rw-move-sigma F` (move noise as a fraction of the
+  per-dimension std, default 0.1). Not available for `myvector`.
 
 ## Methodology notes (learned the hard way)
 
