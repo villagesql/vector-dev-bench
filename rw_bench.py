@@ -84,11 +84,17 @@ def _rw_write_worker(arg):
     Uses the same shared WALL-CLOCK start t_start as the readers, so writes begin
     at t_start + start_offset and the read-QPS graph aligns.
     arg = (socket, database, dim, batch, delay, t_start, start_offset,
-           write_duration, id_base, seed)."""
+           write_duration, id_base, seed, vec_literal, vec_encode, max_rows).
+    max_rows (None = unbounded) caps this writer's inserted rows -- needed for
+    engines whose index has a fixed capacity (an overflow aborts MyVector).
+    vec_literal/vec_encode are the profile's, so concurrent rows use the same
+    SQL encoding as the initial load (e.g. myvector_construct('[...]'), or the
+    _binary X'..' form) rather than a bare '[...]' string."""
     import time as _t
     import numpy as _np
     (socket, database, dim, batch, delay, t_start, start_offset, write_duration,
-     id_base, seed) = arg
+     id_base, seed, vec_literal, vec_encode, max_rows) = arg
+    lit = core.make_lit(vec_literal, vec_encode, dim)
     conn = _new_mysql_conn(socket, database=database)
     rng = _np.random.default_rng(seed)
     nid = id_base
@@ -102,19 +108,24 @@ def _rw_write_worker(arg):
             _t.sleep(0.01)
         deadline = t_start + start_offset + write_duration
         while _t.time() < deadline:
-            vecs = rng.standard_normal((batch, dim)).astype(_np.float32)
+            if max_rows is not None and n >= max_rows:
+                break  # budget spent: stop rather than overflow the index
+            # Integer-valued (truncated) components, as before -- short SQL, and
+            # for '{lit}'-style profiles the text is byte-identical to the old
+            # hand-built '[...]'. int32 first so -0.x truncates to 0, not "-0".
+            nb = batch if max_rows is None else min(batch, max_rows - n)
+            vecs = (rng.standard_normal((nb, dim))
+                    .astype(_np.int32).astype(_np.float32))
             rows = ",\n".join(
-                "({}, '[{}]')".format(nid + j,
-                                      ",".join(str(int(x)) for x in vecs[j]))
-                for j in range(batch))
+                "({}, {})".format(nid + j, lit(vecs[j])) for j in range(nb))
             if w_start is None:
                 w_start = _t.time()
             try:
                 cur.execute(f"INSERT INTO t VALUES\n{rows}")
             except Exception as e:  # noqa: BLE001
                 return (n, (w_end or _t.time()) - (w_start or _t.time()), str(e))
-            nid += batch
-            n += batch
+            nid += nb
+            n += nb
             w_end = _t.time()
             if delay > 0:
                 _t.sleep(delay)
@@ -122,6 +133,12 @@ def _rw_write_worker(arg):
         return (n, elapsed, None)
     finally:
         conn.close()
+
+
+# Default write budget for fixed-capacity indexes (MyVector's size=): roughly
+# what the default 2 unthrottled writers x 10 s insert at small dims, reserved
+# as index headroom so the writers can never overflow the graph.
+FIXED_CAP_DEFAULT_ROWS = 100_000
 
 
 def main():
@@ -186,6 +203,12 @@ def main():
                     help="rw-bench: seconds to sleep between INSERT statements "
                          "per writer -- dials write pressure (0 = as fast as "
                          "possible; default 0)")
+    ap.add_argument("--rw-max-rows", type=int, default=None,
+                    help="rw-bench: cap on the TOTAL rows all writers insert "
+                         "(split evenly). Unbounded by default, except for "
+                         "fixed-capacity indexes (myvector), which default to "
+                         f"{FIXED_CAP_DEFAULT_ROWS:,} and reserve that much index "
+                         "headroom up front.")
     ap.add_argument("--rw-write-batch", type=int, default=100,
                     help="rw-bench: rows per writer INSERT statement (default 100)")
     ap.add_argument("--rw-csv", default=None,
@@ -213,6 +236,12 @@ def main():
         args.socket = f"tcp:{args.host}:{args.port}"
 
     prof, metric, _sweep = core.resolve_profile(args)
+    # Fixed-capacity indexes need room for the concurrent writes reserved at
+    # build time, and the writers capped to it (an overflow aborts MyVector).
+    if prof.get("fixed_capacity") and args.rw_max_rows is None:
+        args.rw_max_rows = FIXED_CAP_DEFAULT_ROWS
+    if prof.get("fixed_capacity"):
+        args.index_headroom = args.rw_max_rows
     r = core.build_index(args, prof, metric)
     metric = r.metric      # possibly dataset-overridden
     lit = r.lit
@@ -231,7 +260,7 @@ def main():
     if ef_param.get("style") == "set":
         core.run_sql(args.mysql, args.socket,
                      f"SET GLOBAL {ef_param['var']} = {ef};")
-    _db = "recall_bench"
+    _db = core.MYSQL_SCHEMA
     # Pre-build the read SQL pool; readers cycle through it. Built ONCE here,
     # outside the timed loop. --rw-read-sql overrides the KNN query with an
     # arbitrary read (e.g. "SELECT MAX(id) FROM t") -- a CONTROL: if a plain
@@ -240,6 +269,15 @@ def main():
     # path; if only the KNN read fails, it's the custom-index path.
     if args.rw_read_sql:
         query_sqls = [args.rw_read_sql]
+    elif prof.get("query_sql") and not args.no_index:
+        # Engines with a full query template (e.g. MyVector's WHERE-gated,
+        # row-distance-ordered ANN read) that isn't a plain ORDER BY <dist>.
+        # Such engines take ef_search inline in the query (MyVector only accepts
+        # it there), so it's formatted into each query here.
+        qtmpl = prof["query_sql"]
+        query_sqls = [
+            qtmpl.format(qlit=lit(queries[qi]), k=args.k, ef=ef, db=core.MYSQL_SCHEMA)
+            for qi in range(args.queries)]
     else:
         order = metric.get("order", "")
         query_sqls = [
@@ -255,9 +293,15 @@ def main():
                    args.rw_sample_every, args.k, args.rw_read_uncommitted)
                   for _ in range(nR)]
     id_block = 10_000_000  # disjoint id range per writer (no PK collision)
+    # Split the write budget so the per-writer caps sum to exactly rw_max_rows.
+    def _budget(w):
+        if args.rw_max_rows is None:
+            return None
+        return args.rw_max_rows // nW + (1 if w < args.rw_max_rows % nW else 0)
     write_tasks = [(args.socket, _db, args.dim, args.rw_write_batch,
                     args.rw_write_delay, t_start, args.rw_write_start,
-                    args.rw_write_duration, args.n + w * id_block, 1000 + w)
+                    args.rw_write_duration, args.n + w * id_block, 1000 + w,
+                    prof["vec_literal"], prof.get("vec_encode"), _budget(w))
                    for w in range(nW)]
 
     ctx = mp.get_context("spawn")
@@ -305,6 +349,12 @@ def main():
              if wrote else "")
     print(f"total reads={total_reads}  writes={wrote} rows{wrate}"
           f"{'  WRITE ERRORS: ' + str(werrs[:2]) if werrs else ''}")
+    if args.rw_max_rows is not None and wrote >= args.rw_max_rows:
+        print(f"NOTE: writers reached --rw-max-rows={args.rw_max_rows:,} before "
+              f"the write window ended (stopped after {w_elapsed:.1f}s of "
+              f"{args.rw_write_duration:.0f}s); the read+write QPS below includes "
+              f"seconds with no writes. Raise --rw-max-rows or --rw-write-delay "
+              f"to cover the whole window.")
     peak = max(qps_series) or 1
     blocks = "▁▂▃▄▅▆▇█"
     spark = "".join(blocks[min(7, int(q / peak * 7))] for q in qps_series)

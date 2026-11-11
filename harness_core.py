@@ -23,6 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 DEFAULT_SOCKET = os.path.join(HERE, ".run", "mysqld.sock")
 
+# The schema the mysql-family tools build into (Postgres uses its pre-created
+# `bench` db instead). Centralized so a profile template that must name the
+# fully-qualified table (e.g. MyVector's `{db}.t.v`) stays in sync with it.
+MYSQL_SCHEMA = "recall_bench"
+
 
 def detect_srv_build():
     """Server build dir: $SRV_BUILD, else VillageSQL_BUILD_DIR from the
@@ -237,6 +242,85 @@ PROFILES = {
                        "dist_fn": "APPROX_DISTANCE(v, {qlit}, 'distance_measure=dot_product, num_leaves_to_search={ef}')"},
         },
     },
+    # MyVector (https://github.com/askdba/myvector) -- a MySQL *component*
+    # adding HNSW via UDFs + stored procedures. It
+    # does not fit the ORDER-BY-distance mold: the vector lives in a VARBINARY
+    # column whose COMMENT ("MYVECTOR COLUMN ...") declares the HNSW index; the
+    # graph is built by a stored proc AFTER the load (build_sql), and KNN gates
+    # the index with a WHERE function then orders by a row-distance helper
+    # (query_sql). Talks the mysql client (PyMySQL); ef_search rides inline in the
+    # query. Needs the component INSTALLed + its procs/UDFs registered first
+    # (start_myvector.sh does this).
+    "myvector": {
+        "extension": None,  # a component, installed out of band (start_myvector.sh)
+        # VARBINARY wide enough for dim float32 + an 8-byte header. The MYVECTOR
+        # COMMENT is what turns the column into an HNSW index.
+        "coltype": "VARBINARY({col_bytes})",
+        "vec_literal": "myvector_construct('{lit}')",
+        "ef_param": {"style": "inline"},  # ef_search rides inside query_sql
+        # Option keys are case-sensitive in MyVector: `M=`, not `m=` (a lowercase
+        # key is silently ignored and the graph falls back to M=16).
+        # size = HNSW capacity ({cap} = rows + any rw_bench write headroom; MyVector
+        # never grows the graph, and an insert past capacity aborts mysqld);
+        # dist = L2 or Cosine; ef = ef_construction. online=Y: a MyVector
+        # background thread follows the binlog and applies later INSERTs to the
+        # graph asynchronously (after commit, not inside the INSERT as on the
+        # other engines), so rw_bench's concurrent writes are indexed (needs
+        # myvector.cnf, which start_myvector.sh writes).
+        "table_ddl": (
+            "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL "
+            "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={cap},M={M},"
+            "ef={efc},online=Y,idcol=id,dist={dist}') ENGINE=InnoDB;"),
+        "no_index_table_ddl": (
+            "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
+            "ENGINE=InnoDB;"),
+        # The HNSW graph has a fixed capacity (size=), so rw_bench must reserve
+        # headroom for its writers and cap them to it (--rw-max-rows).
+        "fixed_capacity": True,
+        # A built index lives on in MyVector's memory after DROP DATABASE and, with
+        # online=Y, keeps applying binlog INSERTs for '{db}.t.v' -- so the NEXT
+        # run's load would flow into the old graph and can overflow its capacity
+        # (which aborts mysqld). Drop it before setup whenever the previous t.v was
+        # a MyVector column (index_drop_if returns a count; DROP needs the column).
+        # An index whose table was dropped out of band (not by this harness) is
+        # missed here -- MYVECTOR_INDEX_DROP can't name a column that no longer
+        # exists; restart the server (or use a fresh start_myvector.sh container).
+        "index_drop_if": ("SELECT COUNT(*) FROM information_schema.columns "
+                          "WHERE table_schema = '{db}' AND table_name = 't' "
+                          "AND column_name = 'v' AND column_comment LIKE 'MYVECTOR%'"),
+        "index_drop_sql": "CALL mysql.MYVECTOR_INDEX_DROP('{db}.t.v')",
+        # Offline bulk build after the load, timed as the index step. DROP first:
+        # MyVector keeps built indexes in memory keyed by '{db}.t.v', and that
+        # survives the harness's DROP DATABASE -- so a second run on the same
+        # server (other metric, M, ef_construction, data) would otherwise silently
+        # reuse the FIRST run's graph (e.g. a cosine table searched through an L2
+        # index: recall stuck ~0.65 at any ef). DROP is a no-op if none exists.
+        "build_sql": ("CALL mysql.MYVECTOR_INDEX_DROP('{db}.t.v'); "
+                      "CALL mysql.MYVECTOR_INDEX_BUILD('{db}.t.v', 'id')"),
+        # KNN. The documented surface is `WHERE MYVECTOR_IS_ANN(col, idcol, qvec,
+        # opts)`, but that is syntax a server-side audit/parse hook rewrites into
+        # the subquery below -- and that rewrite aborts when several statements
+        # arrive in one packet (error 3164, EVENT_TRACKING_PARSE), which is how
+        # this harness batches queries (PyMySQL MULTI_STATEMENTS). So we emit the
+        # already-rewritten form (myvector_ann_set -> JSON_TABLE of neighbour ids),
+        # which needs no rewrite and batches cleanly. myvector_ann_set also
+        # populates the per-row distances that myvector_row_distance(id) reads, so
+        # ORDER BY ... LIMIT k returns the k nearest. k + ef_search ride in opts;
+        # {qlit} is already myvector_construct('[...]').
+        "query_sql": (
+            "SELECT id FROM t WHERE ( id IN (select `myvecid` from "
+            "(select myvector_ann_set('{db}.t.v', 'id', {qlit}, "
+            "'nn={k},ef_search={ef}') `_mvjson`) `_mvsrc`, "
+            "JSON_TABLE(`_mvsrc`.`_mvjson`, '$[*]' "
+            "COLUMNS(`myvecid` BIGINT PATH '$')) `myvector_ann`) ) "
+            "ORDER BY myvector_row_distance(id) LIMIT {k}"),
+        "metrics": {
+            # dist_fn is the brute-force fallback (only used by --no-index); the
+            # ANN path uses query_sql. idx_modifier is unused (index via COMMENT).
+            "l2":     {"idx_modifier": "", "dist_fn": "myvector_distance(v, {qlit}, 'L2')"},
+            "cosine": {"idx_modifier": "", "dist_fn": "myvector_distance(v, {qlit}, 'Cosine')"},
+        },
+    },
 }
 
 
@@ -417,7 +501,7 @@ def _reader_init(socket):
     query statements use unqualified table names and would otherwise fail with
     "No database selected"."""
     global _WORKER_CONN
-    _db = None if CLIENT == "psql" else "recall_bench"
+    _db = None if CLIENT == "psql" else MYSQL_SCHEMA
     _WORKER_CONN = _new_mysql_conn(socket, database=_db)
 
 
@@ -525,6 +609,23 @@ def run_sql(client_bin, socket, sql, want_rows=False):
 
 def vec_lit(v):
     return "[" + ",".join(f"{x:.6g}" for x in v) + "]"
+
+
+def make_lit(vec_literal, vec_encode, dim):
+    """Return lit(v) -> the profile's SQL literal for vector v. Module-level and
+    built from plain strings so a spawned worker (e.g. rw_bench's writers) can
+    rebuild the exact encoding the initial load used -- see build_index()."""
+    if vec_encode == "hex":
+        def _lit_slot(v):
+            a = np.asarray(v, "<f4")
+            header = (0x8000 | a.size).to_bytes(2, "big")
+            return (header + a.tobytes()).hex()
+    else:
+        _lit_slot = vec_lit
+
+    def lit(v):
+        return vec_literal.format(lit=_lit_slot(v), dim=dim)
+    return lit
 
 
 # Config the harness pulls FROM THE LIVE SERVER (not from the launch flags — a
@@ -715,7 +816,25 @@ def build_index(args, prof, metric):
     # VARCHAR control sizes its column to hold a dim-d vector's '[...]' text:
     # up to ~ (max-int-chars + comma) per element, plus brackets. Generous cap.
     varchar_len = max(64, args.dim * 12 + 4)
-    coltype = prof["coltype"].format(dim=args.dim, varchar_len=varchar_len)
+    # Shared SQL-template kwargs. Profiles reference only the fields they need
+    # (str.format ignores the rest), so new fields here don't touch existing
+    # profiles. `col_bytes`/`n`/`efc`/`dist` exist for engines whose column or
+    # index declaration encodes the vector byte-width, row count, build breadth,
+    # or metric by name (e.g. MyVector's VARBINARY width + its MYVECTOR COMMENT).
+    tmpl_kw = {
+        "dim": args.dim,
+        "varchar_len": varchar_len,
+        "col_bytes": args.dim * 4 + 8,      # MyVector VARBINARY: 4B/float + 8B header
+        "n": args.n,
+        # Index capacity for fixed-size graphs (MyVector's size=): the initial
+        # rows plus any headroom rw_bench reserves for its concurrent writers.
+        "cap": args.n + (getattr(args, "index_headroom", 0) or 0),
+        "M": args.M,
+        "efc": args.ef_construction,
+        "dist": {"l2": "L2", "cosine": "Cosine"}.get(args.metric, ""),
+        "db": MYSQL_SCHEMA,   # schema the mysql tools build into; {db}.t.v for MyVector
+    }
+    coltype = prof["coltype"].format(**tmpl_kw)
     # index_ddl only exists for the separate-CREATE-INDEX profiles; profiles with
     # a full table_ddl (e.g. mariadb) don't have it.
     # {lists} is the IVF cell count (turbovec_ivf); --lists unset means
@@ -748,7 +867,21 @@ def build_index(args, prof, metric):
     # (table_ddl profiles, e.g. MariaDB) declare the index in CREATE TABLE and
     # build incrementally by architecture, so post isn't available for them.
     post_index = None
-    if args.index_mode == "post" and not args.no_index:
+    if "build_sql" in prof and not args.no_index:
+        # Engines whose index is built by an explicit post-load statement (e.g.
+        # MyVector's `CALL MYVECTOR_INDEX_BUILD(...)`) rather than CREATE INDEX or
+        # an inline VECTOR INDEX. The column DDL declares the index parameters (in
+        # MyVector's case via the MYVECTOR COMMENT); the actual graph is built here
+        # after the load, timed as the index step. There is no incremental form,
+        # so (like turbovec_ivf) require --index-mode post rather than silently
+        # overriding the default `incremental`.
+        if args.index_mode != "post":
+            print(f"ERROR: profile '{args.profile}' builds its index after the "
+                  f"load (build_sql), so it needs --index-mode post.",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        post_index = prof["build_sql"].format(**tmpl_kw)
+    elif args.index_mode == "post" and not args.no_index:
         if "index_ddl" not in prof:
             print(f"ERROR: --index-mode post needs a profile with a separate "
                   f"index_ddl; '{args.profile}' builds the index inline in "
@@ -762,7 +895,7 @@ def build_index(args, prof, metric):
 
     if "table_ddl" in prof:
         key = "no_index_table_ddl" if args.no_index else "table_ddl"
-        schema = prof[key].format(dim=args.dim, M=args.M)
+        schema = prof[key].format(**tmpl_kw)
     else:
         # incremental: index in setup; post/no-index: table only, index later/never
         ddl_line = "" if (args.no_index or post_index) else index_ddl + ";"
@@ -776,17 +909,25 @@ def build_index(args, prof, metric):
         setup = f"DROP TABLE IF EXISTS t;\n{schema}"
     else:
         setup = f"""
-DROP DATABASE IF EXISTS recall_bench;
-CREATE DATABASE recall_bench; USE recall_bench;
+DROP DATABASE IF EXISTS {MYSQL_SCHEMA};
+CREATE DATABASE {MYSQL_SCHEMA}; USE {MYSQL_SCHEMA};
 {schema}
 """
+    # Engines whose index outlives DROP DATABASE (MyVector) declare a guarded
+    # drop to run BEFORE setup, so the old index can't capture this run's load.
+    if prof.get("index_drop_sql") and CLIENT != "psql":
+        guard = prof["index_drop_if"].format(**tmpl_kw)
+        if any(l.strip() not in ("", "0") for l in
+               run_sql(args.mysql, args.socket, guard + ";", want_rows=True)):
+            run_sql(args.mysql, args.socket,
+                    prof["index_drop_sql"].format(**tmpl_kw) + ";")
     run_sql(args.mysql, args.socket, setup)
     # Select the working schema on the persistent connection so all later
     # run_sql() statements run in-context (no USE prefix). The setup's own
-    # trailing `USE recall_bench` set it for the setup batch, but be explicit so
+    # trailing `USE {MYSQL_SCHEMA}` set it for the setup batch, but be explicit so
     # it survives even if run_sql reconnects.
     if CLIENT != "psql":
-        _mysql_conn(args.socket).select_db("recall_bench")
+        _mysql_conn(args.socket).select_db(MYSQL_SCHEMA)
 
     # {lit} is either the decimal inner text ([...] path) or, for a profile that
     # sets vec_encode=hex, the hex of the binary ingest form (wrapped by
@@ -802,14 +943,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
     # the header the value is parsed as decimal and fails as a WARNING, not an
     # error -- the rows land empty and the run looks like a recall collapse
     # rather than an encoding bug.
-    if prof.get("vec_encode") == "hex":
-        def _lit_slot(v):
-            a = np.asarray(v, "<f4")
-            header = (0x8000 | a.size).to_bytes(2, "big")
-            return (header + a.tobytes()).hex()
-    else:
-        _lit_slot = vec_lit
-    def lit(v): return prof["vec_literal"].format(lit=_lit_slot(v), dim=args.dim)
+    lit = make_lit(prof["vec_literal"], prof.get("vec_encode"), args.dim)
 
     # --- build: INSERT all rows (timed). ef_search is query-time, so a sweep
     # re-queries this same graph without rebuilding.
@@ -854,7 +988,7 @@ CREATE DATABASE recall_bench; USE recall_bench;
         # Each task = (socket, database, per-batch-INSERT-statements). The worker
         # opens its own connection with the schema selected (no USE prefix, no
         # shared pool connection).
-        _db = None if CLIENT == "psql" else "recall_bench"
+        _db = None if CLIENT == "psql" else MYSQL_SCHEMA
         tasks = [(args.socket, _db, _insert_batch_stmts(s)) for s in shards]
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=len(tasks))

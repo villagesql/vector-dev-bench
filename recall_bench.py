@@ -236,9 +236,28 @@ def main():
         # sees a non-@@Q digit row per query, which is fine.
         if args.dry_run:
             return "SELECT 1;"
-        fmt = {"qlit": lit(queries[qi])}
+        qlit = lit(queries[qi])
+        efv = ef if ef is not None else args.ef_search
+        # Engines whose ANN search is not a plain `ORDER BY <dist>` (e.g. MyVector
+        # gates the index via a WHERE function and orders by a row-distance helper)
+        # declare a full `query_sql` template with {qlit}/{k}/{ef} placeholders.
+        # With --no-index there is no index to gate, so fall back to the profile's
+        # brute-force dist_fn (the ORDER BY form below).
+        qtmpl = None if args.no_index else prof.get("query_sql")
+        # Inline-ef engines (google, myvector) carry ef_search inside the query,
+        # so there is no server-side default to fall back on. Fail clearly rather
+        # than formatting a literal `None` into the SQL -- but only when the
+        # template actually takes {ef} (myvector's brute-force dist_fn doesn't).
+        if ef_inline and efv is None and "{ef}" in (qtmpl or metric["dist_fn"]):
+            print(f"ERROR: profile '{args.profile}' passes ef_search inline per "
+                  f"query; give it a value with --ef-search N or "
+                  f"--ef-search-sweep <list>.", file=sys.stderr)
+            raise SystemExit(2)
+        if qtmpl:
+            return qtmpl.format(qlit=qlit, k=args.k, ef=efv, db=core.MYSQL_SCHEMA) + ";"
+        fmt = {"qlit": qlit}
         if ef_inline:
-            fmt["ef"] = ef if ef is not None else args.ef_search
+            fmt["ef"] = efv
         dist = metric["dist_fn"].format(**fmt)
         order = metric.get("order", "")
         return f"SELECT id FROM t ORDER BY {dist} {order} LIMIT {args.k};"
