@@ -193,10 +193,14 @@ so the profile needs `--index-mode post`. KNN uses MyVector's `myvector_ann_set`
 form (the `MYVECTOR_IS_ANN` syntax is rewritten by a parse hook that rejects
 multi-statement batches) and takes `ef_search` inline, so pass `--ef-search` or
 `--ef-search-sweep`. Metrics: l2 and cosine. The index is created with
-`online=Y`, so MyVector follows the binlog and indexes `rw_bench.py`'s concurrent
-writes like the other engines do. Its capacity is fixed at build time, so
+`online=Y`, so a MyVector background thread follows the binlog and applies
+`rw_bench.py`'s concurrent writes to the graph asynchronously, after commit;
+the other engines update the index inside the INSERT, so writer throughput here
+excludes index maintenance. Its capacity is fixed at build time, so
 `rw_bench.py` reserves room for those writes and caps them (`--rw-max-rows`,
-default 100,000).
+default 100,000). Unused capacity is cheap: at 784 dims, a 102,000-row index
+grew mysqld's RSS by ~10 MB at build vs ~8 MB for 2,000; memory is only touched
+as rows are added.
 ```bash
 MYVECTOR_SO=/path/to/libmyvector_component.so \
 MYVECTOR_PROCS=/path/to/myvector/sql/myvector_install_component.sql \

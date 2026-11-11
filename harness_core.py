@@ -242,8 +242,8 @@ PROFILES = {
                        "dist_fn": "APPROX_DISTANCE(v, {qlit}, 'distance_measure=dot_product, num_leaves_to_search={ef}')"},
         },
     },
-    # MyVector (https://github.com/askdba/myvector) -- a MySQL *component* (no
-    # server fork) adding disk-persisted HNSW via UDFs + stored procedures. It
+    # MyVector (https://github.com/askdba/myvector) -- a MySQL *component*
+    # adding HNSW via UDFs + stored procedures. It
     # does not fit the ORDER-BY-distance mold: the vector lives in a VARBINARY
     # column whose COMMENT ("MYVECTOR COLUMN ...") declares the HNSW index; the
     # graph is built by a stored proc AFTER the load (build_sql), and KNN gates
@@ -262,10 +262,11 @@ PROFILES = {
         # key is silently ignored and the graph falls back to M=16).
         # size = HNSW capacity ({cap} = rows + any rw_bench write headroom; MyVector
         # never grows the graph, and an insert past capacity aborts mysqld);
-        # dist = L2 or Cosine; ef = ef_construction. online=Y: MyVector follows the
-        # binlog and applies later INSERTs to the graph, so rw_bench's concurrent
-        # writes are indexed like on the other engines (needs myvector.cnf, which
-        # start_myvector.sh writes).
+        # dist = L2 or Cosine; ef = ef_construction. online=Y: a MyVector
+        # background thread follows the binlog and applies later INSERTs to the
+        # graph asynchronously (after commit, not inside the INSERT as on the
+        # other engines), so rw_bench's concurrent writes are indexed (needs
+        # myvector.cnf, which start_myvector.sh writes).
         "table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL "
             "COMMENT 'MYVECTOR COLUMN type=hnsw,dim={dim},size={cap},M={M},"
@@ -273,8 +274,6 @@ PROFILES = {
         "no_index_table_ddl": (
             "CREATE TABLE t (id INT PRIMARY KEY, v VARBINARY({col_bytes}) NOT NULL) "
             "ENGINE=InnoDB;"),
-        # Built after the load (build_sql), never incrementally: needs --index-mode post.
-        "index_mode": "post",
         # The HNSW graph has a fixed capacity (size=), so rw_bench must reserve
         # headroom for its writers and cap them to it (--rw-max-rows).
         "fixed_capacity": True,
@@ -283,6 +282,9 @@ PROFILES = {
         # run's load would flow into the old graph and can overflow its capacity
         # (which aborts mysqld). Drop it before setup whenever the previous t.v was
         # a MyVector column (index_drop_if returns a count; DROP needs the column).
+        # An index whose table was dropped out of band (not by this harness) is
+        # missed here -- MYVECTOR_INDEX_DROP can't name a column that no longer
+        # exists; restart the server (or use a fresh start_myvector.sh container).
         "index_drop_if": ("SELECT COUNT(*) FROM information_schema.columns "
                           "WHERE table_schema = '{db}' AND table_name = 't' "
                           "AND column_name = 'v' AND column_comment LIKE 'MYVECTOR%'"),
@@ -296,7 +298,7 @@ PROFILES = {
         "build_sql": ("CALL mysql.MYVECTOR_INDEX_DROP('{db}.t.v'); "
                       "CALL mysql.MYVECTOR_INDEX_BUILD('{db}.t.v', 'id')"),
         # KNN. The documented surface is `WHERE MYVECTOR_IS_ANN(col, idcol, qvec,
-        # opts)`, but that is sugar a server-side audit/parse hook rewrites into
+        # opts)`, but that is syntax a server-side audit/parse hook rewrites into
         # the subquery below -- and that rewrite aborts when several statements
         # arrive in one packet (error 3164, EVENT_TRACKING_PARSE), which is how
         # this harness batches queries (PyMySQL MULTI_STATEMENTS). So we emit the

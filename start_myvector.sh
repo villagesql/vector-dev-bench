@@ -148,15 +148,18 @@ for proc in MYVECTOR_INDEX_DROP MYVECTOR_INDEX_BUILD; do
     missing="$missing mysql.$proc"
   fi
 done
-# The profile declares online=Y (MyVector follows the binlog to index rw_bench's
-# concurrent writes), which needs row-based binary logging -- the stock image's
-# default, but check rather than assume.
-if [ "$(count "SELECT CONCAT(@@log_bin, @@binlog_format);")" != "1ROW" ]; then
-  missing="$missing log_bin=ON+binlog_format=ROW"
-fi
 if [ -n "$missing" ]; then
   echo "ERROR: MyVector objects missing:$missing -- check the component build" \
        "and MYVECTOR_PROCS." >&2
+  exit 1
+fi
+# The profile declares online=Y (MyVector follows the binlog to index rw_bench's
+# concurrent writes), which needs row-based binary logging -- the stock image's
+# default, but check rather than assume.
+binlog="$(count "SELECT CONCAT('log_bin=', IF(@@log_bin, 'ON', 'OFF'), ' binlog_format=', @@binlog_format);")"
+if [ "$binlog" != "log_bin=ON binlog_format=ROW" ]; then
+  echo "ERROR: online index updates need log_bin=ON and binlog_format=ROW;" \
+       "this server has $binlog." >&2
   exit 1
 fi
 

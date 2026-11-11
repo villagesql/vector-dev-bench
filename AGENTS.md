@@ -30,8 +30,8 @@ language neutral between engines.
 matching `start_<engine>.sh` (or, for another Postgres extension, a
 `PG_EXTENSION` case in `start_postgres.sh`). Registered profiles today:
 `vsql_vector`, `mariadb`, `pgvector`, `turbovec` / `turbovec_ivf` (pg_turbovec
-flat and IVF), `google` (Google MySQL + ScaNN), `myvector` (a MySQL component
-with disk-persisted HNSW), and `varchar_ctrl` (a plain-VARCHAR insert-only
+flat and IVF), `google` (Google MySQL + ScaNN), `myvector` (a MySQL component,
+HNSW), and `varchar_ctrl` (a plain-VARCHAR insert-only
 control). The Postgres profiles (`pgvector`, `turbovec*`) use the `psql` client
 kind; the rest use `mysql`.
 
